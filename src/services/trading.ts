@@ -3,13 +3,10 @@ import {
   PublicKey, 
   Transaction, 
   TransactionInstruction,
-  SystemProgram,
   ComputeBudgetProgram,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import { 
-  TOKEN_PROGRAM_ID, 
-  ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddress,
 } from '@solana/spl-token';
 import type { WalletContextState } from '@solana/wallet-adapter-react';
@@ -32,7 +29,10 @@ export class TradingService {
 
   constructor(connection: Connection, useIdlService: boolean = true) {
     this.connection = connection;
-    this.solanaService = new SolanaService();
+    // Use the same connection endpoint to ensure consistency
+    const endpoint = connection.rpcEndpoint;
+    console.log(`🔗 TradingService: Using RPC endpoint from connection: ${endpoint}`);
+    this.solanaService = new SolanaService(endpoint);
     this.idlService = new PumpFunIdlService(connection);
     this.useIdlService = useIdlService;
   }
@@ -43,31 +43,58 @@ export class TradingService {
     amount: number,
     slippage: number = 5
   ): Promise<Trade | null> {
+    console.log(`🔌 TradingService: Wallet status check:`, {
+      publicKey: wallet.publicKey?.toString(),
+      connected: wallet.connected,
+      signTransaction: !!wallet.signTransaction,
+      wallet: wallet.wallet?.adapter?.name
+    });
+    
     if (!wallet.publicKey || !wallet.signTransaction) {
+      console.error('❌ TradingService: Wallet not connected properly');
+      console.error('Full wallet state:', wallet);
       throw new Error('Wallet not connected');
     }
 
     try {
-      console.log(`Attempting to buy ${token.symbol} for ${amount} SOL`);
+      console.log(`🚀 PRODUCTION BUY: ${token.symbol} for ${amount} SOL`);
       
-      // Get priority fee
-      const priorityFee = await this.solanaService.getPriorityFee();
+      // Get production-grade priority fee with relevant accounts
+      const mintPubkey = new PublicKey(token.address);
+      let bondingCurve: PublicKey;
+      let associatedBondingCurve: PublicKey;
+      
+      if (token.bondingCurve && token.associatedBondingCurve) {
+        bondingCurve = new PublicKey(token.bondingCurve);
+        associatedBondingCurve = new PublicKey(token.associatedBondingCurve);
+      } else {
+        console.log(`🔧 Calculating bonding curve addresses for ${token.symbol}`);
+        const accounts = calculatePumpFunAccounts(mintPubkey);
+        bondingCurve = accounts.bondingCurve;
+        associatedBondingCurve = accounts.associatedBondingCurve;
+      }
+      
+      // Get priority fee with relevant accounts for better accuracy
+      const relevantAccounts = [bondingCurve, associatedBondingCurve, mintPubkey];
+      const priorityFee = await this.solanaService.getPriorityFee(relevantAccounts);
       
       // Create buy transaction
       const transaction = new Transaction();
       
-      // Add compute budget instructions
+      // Add compute budget instructions with production-grade priority fee
       transaction.add(
         ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
       );
       
+      // Calculate bonding curve addresses if not provided (already done above)
+      
       // Add buy instructions
       const buyInstructions = await this.createBuyInstruction(
         wallet.publicKey,
-        new PublicKey(token.address),
-        new PublicKey(token.bondingCurve),
-        new PublicKey(token.associatedBondingCurve),
+        mintPubkey,
+        bondingCurve,
+        associatedBondingCurve,
         amount,
         slippage
       );
@@ -154,13 +181,11 @@ export class TradingService {
     }
 
     try {
-      console.log(`Attempting to sell ${percentage}% of ${token.symbol}`);
+      console.log(`🚀 PRODUCTION SELL: ${percentage}% of ${token.symbol}`);
       
       // Get token account balance
-      const tokenAccount = await getAssociatedTokenAddress(
-        new PublicKey(token.address),
-        wallet.publicKey
-      );
+      const sellMintPubkey = new PublicKey(token.address);
+      const tokenAccount = await getAssociatedTokenAddress(sellMintPubkey, wallet.publicKey);
       
       const tokenAccountInfo = await this.connection.getTokenAccountBalance(tokenAccount);
       const tokenBalance = tokenAccountInfo.value.uiAmount || 0;
@@ -171,13 +196,28 @@ export class TradingService {
       
       const sellAmount = (tokenBalance * percentage) / 100;
       
-      // Get priority fee
-      const priorityFee = await this.solanaService.getPriorityFee();
+      // Calculate bonding curve addresses
+      let sellBondingCurve: PublicKey;
+      let sellAssociatedBondingCurve: PublicKey;
+      
+      if (token.bondingCurve && token.associatedBondingCurve) {
+        sellBondingCurve = new PublicKey(token.bondingCurve);
+        sellAssociatedBondingCurve = new PublicKey(token.associatedBondingCurve);
+      } else {
+        console.log(`🔧 Calculating bonding curve addresses for ${token.symbol}`);
+        const accounts = calculatePumpFunAccounts(sellMintPubkey);
+        sellBondingCurve = accounts.bondingCurve;
+        sellAssociatedBondingCurve = accounts.associatedBondingCurve;
+      }
+      
+      // Get production-grade priority fee with relevant accounts
+      const sellRelevantAccounts = [sellBondingCurve, sellAssociatedBondingCurve, sellMintPubkey];
+      const priorityFee = await this.solanaService.getPriorityFee(sellRelevantAccounts);
       
       // Create sell transaction
       const transaction = new Transaction();
       
-      // Add compute budget instructions
+      // Add compute budget instructions with production-grade priority fee
       transaction.add(
         ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
@@ -186,9 +226,9 @@ export class TradingService {
       // Add sell instruction
       const sellInstruction = await this.createSellInstruction(
         wallet.publicKey,
-        new PublicKey(token.address),
-        new PublicKey(token.bondingCurve),
-        new PublicKey(token.associatedBondingCurve),
+        sellMintPubkey,
+        sellBondingCurve,
+        sellAssociatedBondingCurve,
         sellAmount,
         slippage
       );

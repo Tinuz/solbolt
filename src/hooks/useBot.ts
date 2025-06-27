@@ -38,7 +38,7 @@ export interface UseBotState {
 }
 
 export function useBot(): UseBotState {
-  const { publicKey, connected } = useWallet();
+  const wallet = useWallet();
   const { connection } = useConnection();
   
   // Bot instances
@@ -140,14 +140,14 @@ export function useBot(): UseBotState {
 
   // Initialize bot
   const initializeBot = useCallback(async () => {
-    if (!connected || !publicKey || botRef.current) return;
+    if (!wallet.connected || !wallet.publicKey || botRef.current) return;
     
     try {
       setConnectionStatus('connecting');
       
       const bot = new PumpFunTradingBot(
         connection,
-        { publicKey } as any,
+        wallet,
         config
       );
       
@@ -161,7 +161,7 @@ export function useBot(): UseBotState {
       console.error('❌ Failed to initialize bot:', error);
       setConnectionStatus('error');
     }
-  }, [connected, publicKey, config]);
+  }, [wallet.connected, wallet.publicKey, config]);
 
   // Start bot
   const startBot = useCallback(async () => {
@@ -314,7 +314,7 @@ export function useBot(): UseBotState {
 
   // Initialize on wallet connection
   useEffect(() => {
-    if (connected && publicKey) {
+    if (wallet.connected && wallet.publicKey) {
       initializeBot();
     } else {
       // Clean up when wallet disconnects
@@ -324,7 +324,7 @@ export function useBot(): UseBotState {
       botRef.current = null;
       setConnectionStatus('disconnected');
     }
-  }, [connected, publicKey, initializeBot, isRunning, stopBot]);
+  }, [wallet.connected, wallet.publicKey, initializeBot, isRunning, stopBot]);
 
   // Cleanup on unmount
   useEffect(() => {

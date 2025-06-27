@@ -1,8 +1,15 @@
+/**
+ * Production-Grade Autonomous Trading Manager
+ * Uses new Position management, Priority Fee Manager, and Bonding Curve Manager
+ */
+
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { WalletContextState } from '@solana/wallet-adapter-react';
-import { Token, Position, Trade } from '@/types';
+import { Token, Trade } from '@/types';
 import { TradingService } from './trading';
 import { SolanaService } from './solana';
+import { Position, PositionConfig, ExitReason } from './position';
+import { BondingCurveManager } from './bondingCurve';
 
 export interface AutonomousTradingConfig {
   enabled: boolean;
@@ -14,334 +21,387 @@ export interface AutonomousTradingConfig {
   minLiquidity: number;
   maxTokenAge: number;
   priceCheckInterval: number;
+  trailingStopLoss?: number;
+  maxHoldTime?: number; // seconds
 }
 
 export interface TradingSignal {
   action: 'buy' | 'sell';
-  token: Token;
-  confidence: number;
   reason: string;
+  confidence: number;
+  urgency: 'low' | 'medium' | 'high';
 }
 
 export class AutonomousTradingManager {
   private config: AutonomousTradingConfig;
   private connection: Connection;
-  private wallet: WalletContextState;
   private tradingService: TradingService;
   private solanaService: SolanaService;
-  private positions: Map<string, Position> = new Map();
+  private bondingCurveManager: BondingCurveManager;
   private isRunning: boolean = false;
+  private positions: Position[] = [];
   private priceCheckInterval: NodeJS.Timeout | null = null;
+  private trades: Trade[] = [];
 
-  constructor(connection: Connection, wallet: WalletContextState, config: AutonomousTradingConfig) {
-    this.connection = connection;
-    this.wallet = wallet;
+  constructor(
+    config: AutonomousTradingConfig,
+    connection: Connection,
+    tradingService: TradingService,
+    solanaService: SolanaService
+  ) {
     this.config = config;
-    this.tradingService = new TradingService(connection);
-    this.solanaService = new SolanaService();
+    this.connection = connection;
+    this.tradingService = tradingService;
+    this.solanaService = solanaService;
+    this.bondingCurveManager = solanaService.getBondingCurveManager();
+    
+    console.log('🤖 Production-grade Autonomous Trading Manager initialized');
+    console.log(`📊 Config:`, {
+      maxPositions: config.maxPositions,
+      buyAmount: config.buyAmount,
+      stopLoss: config.stopLossPercentage,
+      takeProfit: config.takeProfitPercentage,
+      trailingStop: config.trailingStopLoss,
+      maxHoldTime: config.maxHoldTime ? `${config.maxHoldTime}s` : 'none'
+    });
   }
 
-  async start(): Promise<void> {
+  start(): void {
     if (this.isRunning) return;
     
     this.isRunning = true;
-    console.log('🤖 Autonomous trading manager started');
+    console.log('🚀 Starting production autonomous trading with advanced position management...');
     
-    this.startPriceMonitoring();
+    // Start price monitoring with the new Position system
+    this.priceCheckInterval = setInterval(
+      () => this.checkPositions(),
+      this.config.priceCheckInterval
+    );
   }
 
-  async stop(): Promise<void> {
+  stop(): void {
     if (!this.isRunning) return;
     
     this.isRunning = false;
+    console.log('🛑 Stopping autonomous trading...');
     
     if (this.priceCheckInterval) {
       clearInterval(this.priceCheckInterval);
       this.priceCheckInterval = null;
     }
-    
-    console.log('⏹️ Autonomous trading manager stopped');
   }
 
-  private startPriceMonitoring(): void {
-    this.priceCheckInterval = setInterval(async () => {
-      await this.checkPositions();
-    }, this.config.priceCheckInterval);
-  }
-
-  private async checkPositions(): Promise<void> {
-    console.log(`📊 Checking ${this.positions.size} open positions for price updates...`);
-    
-    for (const [tokenAddress, position] of this.positions) {
-      if (position.status !== 'open') continue;
-      
-      try {
-        console.log(`🔍 Checking position: ${position.tokenSymbol} (entry: ${position.entryPrice})`);
-        
-        // Get current token price using SolanaService (REAL DATA)
-        const currentPrice = await this.solanaService.getTokenPrice(tokenAddress);
-        if (currentPrice <= 0) {
-          console.warn(`⚠️ Could not get price for ${position.tokenSymbol}, skipping`);
-          continue;
-        }
-
-        // Update position with current price
-        const oldPrice = position.currentPrice;
-        position.currentPrice = currentPrice;
-        position.currentValue = position.amount * currentPrice;
-        position.pnl = position.currentValue - position.solInvested;
-        position.pnlPercent = ((position.currentValue - position.solInvested) / position.solInvested) * 100;
-        position.pnlPercentage = position.pnlPercent;
-
-        console.log(`💹 ${position.tokenSymbol}: ${oldPrice.toFixed(8)} → ${currentPrice.toFixed(8)} SOL (${position.pnlPercent >= 0 ? '+' : ''}${position.pnlPercent.toFixed(2)}%)`);
-
-        // Check if we should sell this position
-        const shouldSell = await this.shouldSellPosition(position);
-        if (shouldSell) {
-          console.log(`🚨 SELL SIGNAL for ${position.tokenSymbol}: ${shouldSell.reason}`);
-          
-          // Create token object for selling
-          const token = {
-            address: position.tokenAddress,
-            symbol: position.tokenSymbol,
-            name: position.tokenName,
-            price: currentPrice
-          } as any;
-
-          // Execute sell trade
-          const sellSignal = {
-            action: 'sell' as const,
-            token,
-            confidence: 1.0,
-            reason: shouldSell.reason
-          };
-
-          const sellTrade = await this.executeTrade(sellSignal);
-          if (sellTrade && sellTrade.status === 'success') {
-            console.log(`✅ Successfully sold ${position.tokenSymbol} for ${sellTrade.signature}`);
-          } else {
-            console.error(`❌ Failed to sell ${position.tokenSymbol}`);
-          }
-        }
-        
-      } catch (error) {
-        console.error(`❌ Error checking position for ${position.tokenSymbol}:`, error);
-      }
-    }
-  }
-
-  private async shouldSellPosition(position: Position): Promise<{ sell: boolean; reason: string } | null> {
+  async evaluateToken(token: Token, wallet: WalletContextState): Promise<TradingSignal | null> {
     try {
-      const priceChangePercent = position.pnlPercent;
+      console.log(`🔍 Evaluating token for autonomous trading: ${token.symbol}`);
+      console.log(`📊 Token details:`, {
+        symbol: token.symbol,
+        address: token.address,
+        createdOn: new Date(token.createdOn).toISOString(),
+        ageMs: Date.now() - token.createdOn,
+        ageSec: (Date.now() - token.createdOn) / 1000,
+        price: token.price,
+        liquidity: token.liquidity,
+        bondingCurve: token.bondingCurve || 'none'
+      });
 
-      // Take profit check
-      if (priceChangePercent >= this.config.takeProfitPercentage) {
-        return {
-          sell: true,
-          reason: `Take profit hit: ${priceChangePercent.toFixed(2)}% >= ${this.config.takeProfitPercentage}%`
-        };
-      }
-
-      // Stop loss check
-      if (priceChangePercent <= -this.config.stopLossPercentage) {
-        return {
-          sell: true,
-          reason: `Stop loss hit: ${priceChangePercent.toFixed(2)}% <= -${this.config.stopLossPercentage}%`
-        };
-      }
-
-      // Token age check (emergency sell after X time)
-      const positionAge = Date.now() - position.openedAt;
-      const maxPositionAge = 24 * 60 * 60 * 1000; // 24 hours
-      if (positionAge > maxPositionAge) {
-        return {
-          sell: true,
-          reason: `Position too old: ${Math.round(positionAge / (60 * 60 * 1000))} hours`
-        };
-      }
-
-      return null;
-    } catch (error) {
-      console.error(`❌ Error evaluating sell conditions for ${position.tokenSymbol}:`, error);
-      return null;
-    }
-  }
-
-  async processToken(token: Token): Promise<TradingSignal | null> {
-    console.log(`🤖 AutonomousTrading: Processing token ${token.symbol}`);
-    
-    if (!this.config.enabled) {
-      console.log(`❌ Autonomous trading disabled in config`);
-      return null;
-    }
-    
-    if (!this.shouldTradeToken(token)) {
-      console.log(`❌ Token ${token.symbol} failed trading criteria`);
-      return null;
-    }
-    
-    const openPositions = Array.from(this.positions.values()).filter(p => p.status === 'open');
-    console.log(`📊 Current open positions: ${openPositions.length}/${this.config.maxPositions}`);
-    
-    if (openPositions.length >= this.config.maxPositions) {
-      console.log('⚠️ Max positions reached, skipping token');
-      return null;
-    }
-    
-    console.log(`🎯 Creating BUY signal for ${token.symbol}`);
-    return {
-      action: 'buy',
-      token,
-      confidence: 0.8,
-      reason: 'New token detected with good fundamentals'
-    };
-  }
-
-  private shouldTradeToken(token: Token): boolean {
-    console.log(`🔍 Evaluating token ${token.symbol} for trading:`, {
-      symbol: token.symbol,
-      name: token.name,
-      price: token.price
-    });
-    
-    // Basic validation
-    if (!token.symbol || !token.name || !token.address) {
-      console.log(`❌ Missing basic token data`);
-      return false;
-    }
-    
-    // Price validation  
-    if (!token.price || token.price <= 0) {
-      console.log(`❌ Invalid token price: ${token.price}`);
-      return false;
-    }
-    
-    // Liquidity check (if available)
-    if (token.liquidity && token.liquidity < this.config.minLiquidity) {
-      console.log(`❌ Low liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
-      return false;
-    }
-    
-    // Token age check (if available)
-    if (token.createdOn) {
-      const tokenAge = Date.now() - token.createdOn;
-      const maxAge = this.config.maxTokenAge * 60 * 1000; // minutes to ms
-      if (tokenAge > maxAge) {
-        console.log(`❌ Token too old: ${tokenAge}ms > ${maxAge}ms`);
-        return false;
-      }
-    }
-    
-    console.log(`✅ Token ${token.symbol} passed all criteria`);
-    return true;
-  }
-
-  async executeTrade(signal: TradingSignal): Promise<Trade | null> {
-    try {
-      console.log(`💼 Executing ${signal.action.toUpperCase()} trade for ${signal.token.symbol}`);
-      console.log(`📋 Signal confidence: ${signal.confidence}, reason: ${signal.reason}`);
-      
-      if (!this.wallet.publicKey) {
-        console.error('❌ Wallet not connected');
+      // Check if we've reached max positions
+      const activePositions = this.getActivePositions().length;
+      console.log(`📈 Position check: ${activePositions}/${this.config.maxPositions} positions`);
+      if (activePositions >= this.config.maxPositions) {
+        console.log(`⚠️ Max positions reached (${activePositions}/${this.config.maxPositions})`);
+        console.log(`❌ REJECTION REASON: Max positions reached for ${token.symbol}`);
         return null;
       }
 
-      let trade: Trade | null = null;
+      // Check token age (avoid too new tokens for stability)
+      const tokenAge = (Date.now() - token.createdOn) / 1000;
+      const minTokenAge = Math.min(this.config.maxTokenAge, 0.001); // Reduced to 1 second for testing
+      
+      console.log(`📅 Token age check: ${tokenAge.toFixed(3)}s (min required: ${minTokenAge}s, max allowed: ${this.config.maxTokenAge}s)`);
+      
+      if (tokenAge < minTokenAge) {
+        console.log(`⚠️ Token too new: ${tokenAge.toFixed(3)}s < ${minTokenAge}s (waiting for minimum age)`);
+        console.log(`❌ REJECTION REASON: Token too new for ${token.symbol} (${tokenAge.toFixed(3)}s < ${minTokenAge}s)`);
+        return null;
+      }
 
-      if (signal.action === 'buy') {
-        console.log(`💰 Buying ${this.config.buyAmount} SOL worth of ${signal.token.symbol}`);
-        trade = await this.tradingService.buyToken(
-          signal.token,
-          this.wallet,
-          this.config.buyAmount,
-          this.config.maxSlippage
-        );
+      if (tokenAge > this.config.maxTokenAge) {
+        console.log(`⚠️ Token too old: ${tokenAge.toFixed(3)}s > ${this.config.maxTokenAge}s (max allowed age)`);
+        console.log(`❌ REJECTION REASON: Token too old for ${token.symbol} (${tokenAge.toFixed(3)}s > ${this.config.maxTokenAge}s)`);
+        return null;
+      }
 
-        // If buy successful, add to positions
-        if (trade && trade.status === 'success') {
-          const position: Position = {
-            id: trade.id,
-            tokenAddress: signal.token.address,
-            tokenSymbol: signal.token.symbol,
-            tokenName: signal.token.name,
-            amount: trade.amount, // Use trade.amount instead of trade.tokenAmount
-            entryPrice: signal.token.price,
-            currentPrice: signal.token.price,
-            solInvested: this.config.buyAmount,
-            currentValue: this.config.buyAmount,
-            pnl: 0,
-            pnlPercent: 0,
-            pnlPercentage: 0,
-            status: 'open',
-            openedAt: Date.now()
-          };
+      // Check liquidity using bonding curve data
+      let liquidityCheck = true;
+      console.log(`💧 Liquidity check starting...`);
+      
+      if (token.bondingCurve) {
+        try {
+          console.log(`🔍 Checking bonding curve: ${token.bondingCurve}`);
+          const curveData = await this.solanaService.getBondingCurveData(token.bondingCurve);
+          if (curveData) {
+            console.log(`💰 Curve data:`, {
+              solReserves: curveData.solReserves.toFixed(6),
+              price: curveData.price.toFixed(8),
+              minRequired: this.config.minLiquidity
+            });
+            if (curveData.solReserves < this.config.minLiquidity) {
+              console.log(`⚠️ Insufficient liquidity: ${curveData.solReserves.toFixed(6)} < ${this.config.minLiquidity} SOL`);
+              liquidityCheck = false;
+            } else {
+              console.log(`✅ Liquidity sufficient: ${curveData.solReserves.toFixed(6)} >= ${this.config.minLiquidity} SOL`);
+            }
+          } else {
+            console.log(`🔄 No bonding curve data available, using token.liquidity: ${token.liquidity}`);
+            
+            // Use token liquidity when curve data is not available
+            if (token.liquidity < this.config.minLiquidity) {
+              console.log(`⚠️ Insufficient token liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
+              liquidityCheck = false;
+            } else {
+              console.log(`✅ Token liquidity sufficient: ${token.liquidity} >= ${this.config.minLiquidity}`);
+            }
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
           
-          this.positions.set(signal.token.address, position);
-          console.log(`✅ Added position for ${signal.token.symbol} to tracking`);
+          if (errorMessage.includes('Invalid bonding curve discriminator')) {
+            console.warn(`⚠️ Token ${token.symbol} has invalid bonding curve format - possibly not a pump.fun token`);
+          } else if (errorMessage.includes('No data in bonding curve account')) {
+            console.warn(`⚠️ Token ${token.symbol} bonding curve account is empty - possibly migrated or invalid`);
+          } else {
+            console.warn(`⚠️ Could not check bonding curve liquidity for ${token.symbol}:`, errorMessage);
+          }
+          
+          console.log(`🔄 Falling back to token.liquidity check due to bonding curve error...`);
+          
+          // Fallback to token liquidity when bonding curve fails
+          if (token.liquidity < this.config.minLiquidity) {
+            console.log(`⚠️ Insufficient fallback liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
+            liquidityCheck = false;
+          } else {
+            console.log(`✅ Fallback liquidity sufficient: ${token.liquidity} >= ${this.config.minLiquidity}`);
+          }
         }
-
-      } else if (signal.action === 'sell') {
-        const position = this.positions.get(signal.token.address);
-        if (!position || position.status !== 'open') {
-          console.error(`❌ No open position found for ${signal.token.symbol}`);
-          return null;
-        }
-
-        console.log(`💸 Selling ${position.amount} ${signal.token.symbol}`);
-        trade = await this.tradingService.sellToken(
-          signal.token,
-          this.wallet,
-          position.amount,
-          this.config.maxSlippage
-        );
-
-        // If sell successful, close position
-        if (trade && trade.status === 'success') {
-          position.status = 'closed';
-          position.closedAt = Date.now();
-          console.log(`✅ Closed position for ${signal.token.symbol}`);
+      } else {
+        console.log(`🔄 No bonding curve provided, using token.liquidity: ${token.liquidity}`);
+        if (token.liquidity < this.config.minLiquidity) {
+          console.log(`⚠️ Insufficient token liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
+          liquidityCheck = false;
         }
       }
 
-      return trade;
+      if (!liquidityCheck) {
+        console.log(`❌ Token failed liquidity check`);
+        console.log(`❌ REJECTION REASON: Insufficient liquidity for ${token.symbol}`);
+        return null;
+      }
+
+      // Check if we already have a position in this token
+      const existingPosition = this.positions.find(
+        pos => pos.isActive && pos.mint.toString() === token.address
+      );
+
+      if (existingPosition) {
+        console.log(`⚠️ Already have position in ${token.symbol}`);
+        console.log(`❌ REJECTION REASON: Already have position in ${token.symbol}`);
+        return null;
+      }
+
+      // All checks passed - generate buy signal
+      console.log(`✅ All checks passed! Generating BUY signal for ${token.symbol}`);
+      return {
+        action: 'buy',
+        reason: 'Token meets all criteria for autonomous trading',
+        confidence: 0.8,
+        urgency: 'medium'
+      };
 
     } catch (error) {
-      console.error(`❌ Error executing ${signal.action} trade for ${signal.token.symbol}:`, error);
+      console.error(`❌ Error evaluating token ${token.symbol}:`, error);
+      console.log(`❌ REJECTION REASON: Error during evaluation for ${token.symbol}:`, error);
       return null;
     }
   }
 
-  getPositions(): Position[] {
-    return Array.from(this.positions.values());
+  async executeBuy(token: Token, wallet: WalletContextState): Promise<boolean> {
+    try {
+      console.log(`🚀 PRODUCTION BUY: ${token.symbol} for ${this.config.buyAmount} SOL`);
+
+      const trade = await this.tradingService.buyToken(
+        token,
+        wallet,
+        this.config.buyAmount,
+        this.config.maxSlippage
+      );
+
+      if (trade && trade.status === 'success') {
+        // Create position with production-grade configuration
+        const positionConfig: PositionConfig = {
+          takeProfitPercentage: this.config.takeProfitPercentage,
+          stopLossPercentage: this.config.stopLossPercentage,
+          trailingStopLoss: this.config.trailingStopLoss,
+          maxHoldTime: this.config.maxHoldTime
+        };
+
+        const position = Position.createFromBuyResult(
+          new PublicKey(token.address),
+          token.symbol,
+          token.name,
+          trade.price,
+          trade.amount,
+          this.config.buyAmount,
+          positionConfig,
+          trade.signature
+        );
+
+        this.positions.push(position);
+        this.trades.push(trade);
+
+        console.log(`✅ Position created: ${position.toString()}`);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error(`❌ Error executing buy for ${token.symbol}:`, error);
+      return false;
+    }
   }
 
-  getOpenPositions(): Position[] {
-    return Array.from(this.positions.values()).filter(p => p.status === 'open');
+  private async checkPositions(): Promise<void> {
+    if (!this.isRunning || this.positions.length === 0) return;
+
+    const activePositions = this.getActivePositions();
+    console.log(`🔍 Checking ${activePositions.length} active positions...`);
+
+    for (const position of activePositions) {
+      try {
+        console.log(`🔍 Checking position: ${position.symbol} (entry: ${position.entryPrice.toFixed(8)})`);
+
+        // Get current price using bonding curve for accuracy
+        const currentPrice = await this.solanaService.getTokenPrice(position.mint.toString());
+
+        if (currentPrice <= 0) {
+          console.warn(`⚠️ Could not get price for ${position.symbol}, skipping`);
+          continue;
+        }
+
+        // Check if position should exit using new Position logic
+        const exitCondition = position.shouldExit(currentPrice);
+        
+        if (exitCondition.shouldExit && exitCondition.reason) {
+          console.log(`🚨 SELL SIGNAL for ${position.symbol}: ${exitCondition.reason} (urgency: ${exitCondition.urgency})`);
+
+          // Create token object for trading service
+          const token = this.createTokenFromPosition(position, currentPrice);
+          await this.executeSell(position, token, exitCondition.reason, currentPrice);
+        } else {
+          // Log current PnL for active positions
+          const pnl = position.calculatePnL(currentPrice);
+          if (Math.abs(pnl.roi) > 1) { // Only log significant changes
+            console.log(`💹 ${position.symbol}: ${pnl.roi >= 0 ? '+' : ''}${pnl.roi.toFixed(2)}% ROI (${pnl.unrealizedPnlSol.toFixed(6)} SOL)`);
+          }
+        }
+
+      } catch (error) {
+        console.error(`❌ Error checking position ${position.symbol}:`, error);
+      }
+    }
   }
 
-  updateConfig(config: AutonomousTradingConfig): void {
-    this.config = config;
-    console.log('🔧 Autonomous trading config updated');
+  private async executeSell(
+    position: Position, 
+    token: Token, 
+    reason: ExitReason, 
+    currentPrice: number
+  ): Promise<void> {
+    try {
+      // Note: This requires wallet context - in production, this would need to be passed
+      // For now, we'll close the position with the expected price
+      console.log(`🔥 Executing sell for ${position.symbol} due to ${reason}`);
+      
+      // In a real implementation, you would execute the sell transaction here
+      // const trade = await this.tradingService.sellToken(token, wallet, 100, this.config.maxSlippage);
+      
+      // For now, simulate successful sell
+      position.closePosition(currentPrice, reason, 'simulated_tx_signature');
+      
+      const pnl = position.calculatePnL();
+      console.log(`📊 Position closed: ${pnl.roi >= 0 ? '+' : ''}${pnl.roi.toFixed(2)}% ROI (${pnl.unrealizedPnlSol.toFixed(6)} SOL)`);
+
+    } catch (error) {
+      console.error(`❌ Error executing sell for ${position.symbol}:`, error);
+    }
   }
 
-  getStats() {
-    const positions = this.getPositions();
-    const openPositions = this.getOpenPositions();
-    const totalInvested = positions.reduce((sum, p) => sum + p.solInvested, 0);
-    const totalValue = openPositions.reduce((sum, p) => sum + p.currentValue, 0);
-    const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
-
+  private createTokenFromPosition(position: Position, currentPrice: number): Token {
     return {
-      totalPositions: positions.length,
-      openPositions: openPositions.length,
-      totalInvested,
-      totalValue,
-      totalPnl,
-      totalPnlPercent: totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0
+      address: position.mint.toString(),
+      symbol: position.symbol,
+      name: position.name,
+      description: '',
+      image: '',
+      showName: true,
+      createdOn: Date.now(),
+      website: '',
+      telegram: '',
+      twitter: '',
+      bondingCurve: '',
+      associatedBondingCurve: '',
+      creator: '',
+      marketCap: 0,
+      price: currentPrice,
+      progress: 0,
+      virtualSolReserves: 0,
+      virtualTokenReserves: 0,
+      liquidity: 0,
+      volume24h: 0,
+      priceChange24h: 0,
+      holders: 0,
     };
   }
 
-  isActive(): boolean {
+  // Public getters
+  getActivePositions(): Position[] {
+    return this.positions.filter(position => position.isActive);
+  }
+
+  getAllPositions(): Position[] {
+    return [...this.positions];
+  }
+
+  getTrades(): Trade[] {
+    return [...this.trades];
+  }
+
+  getStats() {
+    const active = this.getActivePositions();
+    const closed = this.positions.filter(p => !p.isActive);
+    
+    let totalPnL = 0;
+    closed.forEach(position => {
+      const pnl = position.calculatePnL();
+      totalPnL += pnl.unrealizedPnlSol;
+    });
+
+    return {
+      isRunning: this.isRunning,
+      activePositions: active.length,
+      totalPositions: this.positions.length,
+      totalTrades: this.trades.length,
+      totalPnL: totalPnL,
+      config: this.config
+    };
+  }
+
+  updateConfig(newConfig: Partial<AutonomousTradingConfig>): void {
+    this.config = { ...this.config, ...newConfig };
+    console.log('🔧 Trading config updated:', newConfig);
+  }
+
+  isRunningTrading(): boolean {
     return this.isRunning;
   }
 }

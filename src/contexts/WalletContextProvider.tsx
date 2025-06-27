@@ -15,7 +15,7 @@ import {
 import {
   WalletModalProvider,
 } from '@solana/wallet-adapter-react-ui';
-import { clusterApiUrl } from '@solana/web3.js';
+import { configService } from '@/services/config';
 
 // Import wallet adapter CSS
 import '@solana/wallet-adapter-react-ui/styles.css';
@@ -30,8 +30,12 @@ export const WalletContextProvider: React.FC<WalletContextProviderProps> = ({
   // The network can be set to 'devnet', 'testnet', or 'mainnet-beta'
   const network = WalletAdapterNetwork.Mainnet;
 
-  // You can also provide a custom RPC endpoint
-  const endpoint = useMemo(() => clusterApiUrl(network), [network]);
+  // Use the configured RPC endpoint from config service
+  const endpoint = useMemo(() => {
+    const solanaConfig = configService.getSolanaConfig();
+    console.log('🔗 Wallet using RPC endpoint:', solanaConfig.rpcEndpoint);
+    return solanaConfig.rpcEndpoint;
+  }, []);
 
   const wallets = useMemo(
     () => [

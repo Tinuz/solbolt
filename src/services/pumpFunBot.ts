@@ -60,7 +60,10 @@ export class PumpFunTradingBot {
     // Initialize services
     this.tokenMonitor = new TokenMonitorService();
     this.tradingService = new TradingService(connection);
-    this.solanaService = new SolanaService();
+    // Use the same connection endpoint to ensure consistency
+    const endpoint = connection.rpcEndpoint;
+    console.log(`🔗 PumpFunBot: Using RPC endpoint from connection: ${endpoint}`);
+    this.solanaService = new SolanaService(endpoint);
     
     // Initialize stats
     this.stats = {
@@ -134,18 +137,19 @@ export class PumpFunTradingBot {
           stopLossPercentage: this.config.stopLoss,
           takeProfitPercentage: this.config.takeProfit,
           maxSlippage: this.config.slippage,
-          minLiquidity: 10, // Lowered from 1000 to allow more tokens
+          minLiquidity: 1, // Very low for testing (was 10)
           maxTokenAge: this.config.maxTokenAge * 60, // Convert to seconds
           priceCheckInterval: 30000 // 30 seconds
         };
         
         this.autonomousTrading = new AutonomousTradingManager(
+          autonomousConfig,
           this.connection,
-          this.wallet,
-          autonomousConfig
+          this.tradingService,
+          this.solanaService
         );
         
-        await this.autonomousTrading.start();
+        this.autonomousTrading.start();
       }
       
       // Start token monitoring
@@ -250,24 +254,38 @@ export class PumpFunTradingBot {
       });
       console.log(`🤖 Autonomous trading status:`, {
         exists: !!this.autonomousTrading,
-        isActive: this.autonomousTrading?.isActive() || false
+        isActive: this.autonomousTrading?.isRunningTrading() || false
       });
       
       // Use autonomous trading if available
-      if (this.autonomousTrading && this.autonomousTrading.isActive()) {
-        console.log(`🤖 Sending token to autonomous trading...`);
-        const signal = await this.autonomousTrading.processToken(token);
-        if (signal) {
-          console.log(`🎯 Autonomous trading signal received: ${signal.action} ${token.symbol} - ${signal.reason}`);
-          const trade = await this.autonomousTrading.executeTrade(signal);
-          if (trade) {
-            console.log(`✅ Trade executed successfully:`, trade);
-            this.addTrade(trade);
+      if (this.autonomousTrading && this.autonomousTrading.isRunningTrading()) {
+        console.log(`🤖 Evaluating token for autonomous trading: ${token.symbol}`);
+        try {
+          const signal = await this.autonomousTrading.evaluateToken(token, this.wallet);
+          if (signal && signal.action === 'buy') {
+            console.log(`🎯 Autonomous trading signal: ${signal.action} ${token.symbol} - ${signal.reason}`);
+            const success = await this.autonomousTrading.executeBuy(token, this.wallet);
+            if (success) {
+              console.log(`✅ Autonomous buy executed for ${token.symbol}`);
+              // Get the latest trade from the manager
+              const trades = this.autonomousTrading.getTrades();
+              const latestTrade = trades[trades.length - 1];
+              if (latestTrade) {
+                this.addTrade(latestTrade);
+              }
+            } else {
+              console.log(`❌ Autonomous buy failed for ${token.symbol}`);
+            }
           } else {
-            console.log(`❌ Trade execution failed`);
+            if (signal === null) {
+              console.log(`❌ No trading signal generated for ${token.symbol} (evaluateToken returned null)`);
+              console.log(`🔍 Check autonomous trading logs above for specific rejection reason`);
+            } else {
+              console.log(`❌ Unexpected signal result for ${token.symbol}:`, signal);
+            }
           }
-        } else {
-          console.log(`❌ No trading signal generated for ${token.symbol}`);
+        } catch (error) {
+          console.error(`❌ Error evaluating token ${token.symbol} for autonomous trading:`, error);
         }
         return;
       }
