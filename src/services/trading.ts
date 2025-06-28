@@ -36,6 +36,7 @@ export class TradingService {
   private useIdlService: boolean;
   private autonomousWallet: AutonomousWallet | null = null;
   private positionManager: PositionManager | null = null;
+  private onPriceUpdateCallback?: (priceUpdate: any) => void;
 
   constructor(connection: Connection, useIdlService: boolean = true) {
     this.connection = connection;
@@ -90,6 +91,13 @@ export class TradingService {
         await this.handlePositionExit(data);
       });
 
+      // Listen for price update signals to forward to UI
+      this.positionManager.on('priceUpdate', (priceUpdate) => {
+        if (this.onPriceUpdateCallback) {
+          this.onPriceUpdateCallback(priceUpdate);
+        }
+      });
+
       console.log(`📊 Position management enabled with 10s monitoring interval`);
     } catch (error) {
       console.error(`❌ Failed to initialize position manager:`, error);
@@ -112,7 +120,8 @@ export class TradingService {
     console.log(`🚨 Executing position exit: ${token.symbol} (${exitReason}, ${urgency} urgency)`);
     
     try {
-      // Execute sell transaction
+      // Execute sell transaction with better error handling
+      console.log(`🚀 Attempting autonomous sell for ${token.symbol}...`);
       const sellResult = await this.sellTokenAutonomous(token);
       
       if (sellResult) {
@@ -125,12 +134,20 @@ export class TradingService {
         );
         
         console.log(`✅ Successfully exited position: ${token.symbol} - ${exitReason}`);
+        console.log(`💰 Exit price: ${sellResult.price} SOL, Transaction: ${sellResult.signature}`);
       } else {
-        console.error(`❌ Failed to exit position: ${token.symbol}`);
+        console.error(`❌ Failed to exit position: ${token.symbol} - sellResult is null`);
+        console.log(`⚠️ Position will remain open for retry or manual closure`);
         // Position manager will continue monitoring for retry
       }
     } catch (error) {
-      console.error(`❌ Error executing position exit:`, error);
+      console.error(`❌ Error executing position exit for ${token.symbol}:`, error);
+      console.log(`💡 Possible reasons:`);
+      console.log(`   - Network connectivity issues`);
+      console.log(`   - Token already migrated to Raydium`);
+      console.log(`   - Insufficient bonding curve liquidity`);
+      console.log(`   - Missing creator information`);
+      console.log(`⚠️ Position will remain open for retry or manual closure`);
     }
   }
 
@@ -261,25 +278,38 @@ export class TradingService {
               
               const autonomousWalletAdapter = this.getAutonomousWallet();
               if (autonomousWalletAdapter) {
-                // Execute sell directly
-                const sellResult = await this.executeSell(token, autonomousWalletAdapter, 5);
-                
-                if (sellResult) {
-                  console.log(`✅ DIRECT SELL SUCCESS: ${position.symbol} - ${sellResult.signature}`);
-                  console.log(`💰 Sold ${sellResult.amount} tokens for ${sellResult.price} SOL`);
-                  console.log(`🔗 Transaction: https://solscan.io/tx/${sellResult.signature}`);
+                try {
+                  // Execute sell directly with detailed error handling
+                  console.log(`🚀 Attempting to sell ${position.symbol}...`);
+                  const sellResult = await this.executeSell(token, autonomousWalletAdapter, 5);
                   
-                  // Close position tracking AFTER successful sell
-                  this.positionManager.closePosition(
-                    token.address,
-                    sellResult.price,
-                    ExitReason.MANUAL,
-                    sellResult.signature
-                  );
-                } else {
-                  console.log(`❌ DIRECT SELL FAILED: ${position.symbol} - transaction returned null`);
-                  console.log(`⚠️ You may need to manually sell these tokens via pump.fun website`);
-                  console.log(`🔗 Token: https://pump.fun/${token.address}`);
+                  if (sellResult) {
+                    console.log(`✅ DIRECT SELL SUCCESS: ${position.symbol} - ${sellResult.signature}`);
+                    console.log(`💰 Sold ${sellResult.amount} tokens for ${sellResult.price} SOL`);
+                    console.log(`🔗 Transaction: https://solscan.io/tx/${sellResult.signature}`);
+                    
+                    // Close position tracking AFTER successful sell
+                    this.positionManager.closePosition(
+                      token.address,
+                      sellResult.price,
+                      ExitReason.MANUAL,
+                      sellResult.signature
+                    );
+                  } else {
+                    console.log(`❌ DIRECT SELL FAILED: ${position.symbol} - transaction returned null`);
+                    console.log(`⚠️ You may need to manually sell these tokens via pump.fun website`);
+                    console.log(`🔗 Token: https://pump.fun/${token.address}`);
+                    
+                    // Close position tracking anyway to prevent hanging
+                    position.closePosition(position.entryPrice, ExitReason.MANUAL);
+                  }
+                } catch (sellError) {
+                  console.error(`❌ Error during sell of ${position.symbol}:`, sellError);
+                  console.log(`⚠️ ${position.symbol} tokens may still be in your wallet`);
+                  console.log(`💡 Manual sell option: https://pump.fun/${token.address}`);
+                  
+                  // Close position tracking anyway to prevent hanging
+                  position.closePosition(position.entryPrice, ExitReason.MANUAL);
                 }
               } else {
                 console.log(`❌ No autonomous wallet adapter available for ${position.symbol}`);
@@ -709,25 +739,65 @@ export class TradingService {
 
       // Get creator if available - CRITICAL for sell instruction
       let creatorPubkey: PublicKey | undefined;
-      if (token.creator) {
-        creatorPubkey = new PublicKey(token.creator);
-      } else if (curveData.state.creator) {
-        creatorPubkey = curveData.state.creator;
+      try {
+        if (token.creator) {
+          creatorPubkey = new PublicKey(token.creator);
+          console.log(`🔧 Using token.creator: ${creatorPubkey.toString()}`);
+        } else if (curveData.state.creator) {
+          creatorPubkey = curveData.state.creator;
+          console.log(`🔧 Using curveData.state.creator: ${creatorPubkey.toString()}`);
+        } else {
+          // Fallback: try to fetch creator from bonding curve account data
+          console.log(`⚠️ No creator found, attempting to fetch from bonding curve...`);
+          const bondingCurveAccountInfo = await rpcRateLimiter.executeRPCCall(
+            () => this.connection.getAccountInfo(bondingCurve),
+            'getAccountInfo'
+          );
+          
+          if (bondingCurveAccountInfo?.data) {
+            // Parse creator from bonding curve data (creator is at offset 8-40)
+            const creatorBytes = bondingCurveAccountInfo.data.slice(8, 40);
+            creatorPubkey = new PublicKey(creatorBytes);
+            console.log(`🔧 Extracted creator from bonding curve: ${creatorPubkey.toString()}`);
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Error getting creator for ${token.symbol}:`, error);
       }
 
       if (!creatorPubkey) {
+        console.error(`❌ CRITICAL: Creator not found for ${token.symbol}. Cannot create sell instruction.`);
+        console.log(`🔍 Debug info:`, {
+          tokenCreator: token.creator,
+          curveDataState: curveData.state,
+          bondingCurve: bondingCurve.toString()
+        });
         throw new Error(`Creator not found for ${token.symbol}. Cannot create sell instruction.`);
       }
 
       console.log(`🔧 Using creator: ${creatorPubkey.toString()}`);
 
-      const sellInstruction = await createPumpFunSellInstruction(
-        wallet.publicKey!,
-        mintPubkey,
-        tokenAmountToSell,
-        minSolAmount,
-        creatorPubkey  // CRITICAL: Pass creator for vault calculation
-      );
+      let sellInstruction;
+      try {
+        sellInstruction = await createPumpFunSellInstruction(
+          wallet.publicKey!,
+          mintPubkey,
+          tokenAmountToSell,
+          minSolAmount,
+          creatorPubkey  // CRITICAL: Pass creator for vault calculation
+        );
+        console.log(`✅ Successfully created sell instruction for ${token.symbol}`);
+      } catch (error) {
+        console.error(`❌ Error creating sell instruction for ${token.symbol}:`, error);
+        console.log(`🔍 Sell instruction debug:`, {
+          wallet: wallet.publicKey?.toString(),
+          mint: mintPubkey.toString(),
+          tokenAmount: tokenAmountToSell.toString(),
+          minSolAmount: minSolAmount.toString(),
+          creator: creatorPubkey.toString()
+        });
+        throw error;
+      }
 
       transaction.add(sellInstruction);
 
@@ -801,5 +871,12 @@ export class TradingService {
 
   async shouldSellToken(): Promise<boolean> {
     return false;
+  }
+
+  /**
+   * Set callback for price update events from PositionManager
+   */
+  setOnPriceUpdateCallback(callback: (priceUpdate: any) => void): void {
+    this.onPriceUpdateCallback = callback;
   }
 }

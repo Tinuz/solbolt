@@ -24,6 +24,7 @@ export interface BotEventListener {
   onTradeExecuted?: (trade: Trade) => void;
   onPositionOpened?: (position: Position) => void;
   onPositionClosed?: (position: Position, trade: Trade) => void;
+  onPriceUpdate?: (update: { tokenAddress: string; tokenSymbol: string; currentPrice: number; entryPrice: number; pnl: number; pnlPercent: number; amount: number; solInvested: number; }) => void;
   onError?: (error: Error) => void;
   onStatusChange?: (isRunning: boolean) => void;
   onStatsUpdate?: (stats: BotStats) => void;
@@ -64,6 +65,11 @@ export class PumpFunTradingBot {
     const endpoint = connection.rpcEndpoint;
     console.log(`🔗 PumpFunBot: Using RPC endpoint from connection: ${endpoint}`);
     this.solanaService = new SolanaService(endpoint);
+    
+    // Set up price update callback
+    this.tradingService.setOnPriceUpdateCallback((priceUpdate) => {
+      this.notifyListeners('onPriceUpdate', priceUpdate);
+    });
     
     // Initialize stats
     this.stats = {

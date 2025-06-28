@@ -153,8 +153,9 @@ export async function createPumpFunSellInstruction(
   // Instruction data: discriminator + amount + min_slippage_amount
   // FIXED: Use Python discriminator value 12502976635542562355
   const sellDiscriminator = Buffer.alloc(8);
-  // TypeScript fix: cast to any to access Node.js specific method
-  (sellDiscriminator as any).writeBigUInt64LE(BigInt('12502976635542562355'), 0);
+  // TypeScript fix: use DataView for better cross-platform compatibility
+  const dataView = new DataView(sellDiscriminator.buffer, sellDiscriminator.byteOffset, sellDiscriminator.byteLength);
+  dataView.setBigUint64(0, BigInt('12502976635542562355'), true); // true for little-endian
   
   const instructionData = Buffer.concat([
     sellDiscriminator,

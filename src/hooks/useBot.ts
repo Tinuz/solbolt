@@ -22,6 +22,8 @@ export interface UseBotState {
   stopBot: () => Promise<void>;
   updateConfig: (newConfig: Partial<BotConfig>) => void;
   clearHistory: () => void;
+  updatePositionPrices: (tokenAddress: string, newPrice: number) => void; // ⭐ ADD
+  addTestPosition: () => void; // 🧪 TEST function
   
   // Utils
   formatTime: (timestamp: number) => string;
@@ -110,22 +112,32 @@ export function useBot(): UseBotState {
       
       // Update positions based on trade
       if (trade.type === 'buy') {
+        // Calculate token amount from SOL investment and token price
+        const tokenAmount = trade.amount / trade.price; // trade.amount is SOL invested, trade.price is token price
+        
         const position: Position = {
           id: `pos_${trade.id}`,
           tokenAddress: trade.tokenAddress,
           tokenSymbol: trade.tokenSymbol,
           tokenName: trade.tokenSymbol,
-          amount: trade.amount,
+          amount: tokenAmount, // ⭐ FIX: Use calculated token amount, not SOL amount
           entryPrice: trade.price,
           currentPrice: trade.price,
-          solInvested: trade.amount * trade.price,
-          currentValue: trade.amount * trade.price,
+          solInvested: trade.amount, // This is the SOL amount invested
+          currentValue: trade.amount, // Initially same as invested
           pnl: 0,
           pnlPercent: 0,
           pnlPercentage: 0,
           openedAt: trade.timestamp,
           status: 'open'
         };
+        
+        console.log(`📊 Created position for ${trade.tokenSymbol}:`, {
+          tokenAmount: tokenAmount.toFixed(6),
+          solInvested: trade.amount.toFixed(6),
+          entryPrice: trade.price.toFixed(8)
+        });
+        
         setPositions(prev => [position, ...prev]);
       } else {
         // Close position on sell
@@ -141,6 +153,26 @@ export function useBot(): UseBotState {
       setPositions(prev => prev.map(pos => 
         pos.id === position.id ? position : pos
       ));
+    },
+    
+    onPriceUpdate: (update: { tokenAddress: string; tokenSymbol: string; currentPrice: number; entryPrice: number; pnl: number; pnlPercent: number; amount: number; solInvested: number; }) => {
+      console.log('📊 Price update received:', update.tokenSymbol, 'Current:', update.currentPrice, 'PnL:', update.pnlPercent.toFixed(2) + '%');
+      
+      // Update the position with new price data
+      setPositions(prev => prev.map(pos => {
+        if (pos.tokenAddress === update.tokenAddress && pos.status === 'open') {
+          const currentValue = update.amount * update.currentPrice;
+          return {
+            ...pos,
+            currentPrice: update.currentPrice,
+            currentValue,
+            pnl: update.pnl,
+            pnlPercent: update.pnlPercent,
+            pnlPercentage: update.pnlPercent
+          };
+        }
+        return pos;
+      }));
     },
     
     onError: (error: Error) => {
@@ -235,6 +267,72 @@ export function useBot(): UseBotState {
       successfulTrades: 0,
       failedTrades: 0
     }));
+  }, []);
+
+  // Function to update positions with new price data
+  const updatePositionPrices = useCallback((tokenAddress: string, newPrice: number) => {
+    setPositions(prev => prev.map(pos => {
+      if (pos.tokenAddress === tokenAddress && pos.status === 'open') {
+        const currentValue = pos.amount * newPrice;
+        const pnl = currentValue - pos.solInvested;
+        const pnlPercent = pos.solInvested > 0 ? (pnl / pos.solInvested) * 100 : 0;
+        
+        return {
+          ...pos,
+          currentPrice: newPrice,
+          currentValue,
+          pnl,
+          pnlPercent,
+          pnlPercentage: pnlPercent
+        };
+      }
+      return pos;
+    }));
+  }, []);
+
+  // TEST: Add a dummy position for testing the amount calculation
+  const addTestPosition = useCallback(() => {
+    const testTrade: Trade = {
+      id: 'test_' + Date.now(),
+      type: 'buy',
+      tokenAddress: 'HwN6vNdaY89fzuHUhzLD9JyCdyCtpvxE2tApw1u5pump',
+      tokenSymbol: 'INTERN', 
+      amount: 0.001, // 0.001 SOL invested
+      price: 0.00000003, // $0.00000003 per token
+      timestamp: Date.now(),
+      status: 'success'
+    };
+
+    // This should create a position with:
+    // - amount: 0.001 / 0.00000003 = 33,333.33 tokens
+    // - solInvested: 0.001 SOL
+    const tokenAmount = testTrade.amount / testTrade.price;
+    
+    const position: Position = {
+      id: `pos_${testTrade.id}`,
+      tokenAddress: testTrade.tokenAddress,
+      tokenSymbol: testTrade.tokenSymbol,
+      tokenName: testTrade.tokenSymbol,
+      amount: tokenAmount,
+      entryPrice: testTrade.price,
+      currentPrice: testTrade.price,
+      solInvested: testTrade.amount,
+      currentValue: testTrade.amount,
+      pnl: 0,
+      pnlPercent: 0,
+      pnlPercentage: 0,
+      openedAt: testTrade.timestamp,
+      status: 'open'
+    };
+    
+    console.log(`🧪 TEST: Added test position:`, {
+      tokenAmount: tokenAmount.toFixed(2),
+      solInvested: testTrade.amount,
+      price: testTrade.price
+    });
+    
+    setPositions(prev => [position, ...prev]);
+    setTrades(prev => [testTrade, ...prev]);
   }, []);
 
   // Utility functions
@@ -366,6 +464,8 @@ export function useBot(): UseBotState {
     stopBot,
     updateConfig,
     clearHistory,
+    updatePositionPrices, // ⭐ ADD: Function to update position prices
+    addTestPosition, // 🧪 TEST function
     
     // Utils
     formatTime,

@@ -4,6 +4,7 @@
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
+import { EventEmitter } from 'events';
 import { Position } from './Position';
 import { ExitReason, PositionConfig, PositionData } from './types';
 import { SolanaService } from '../solana';
@@ -15,7 +16,18 @@ export interface PositionManagerConfig {
   enableLogging: boolean;     // default true
 }
 
-export class PositionManager {
+export interface PositionPriceUpdate {
+  tokenAddress: string;
+  tokenSymbol: string;
+  currentPrice: number;
+  entryPrice: number;
+  pnl: number;
+  pnlPercent: number;
+  amount: number;
+  solInvested: number;
+}
+
+export class PositionManager extends EventEmitter {
   private positions = new Map<string, Position>();
   private monitoringTasks = new Map<string, NodeJS.Timeout>();
   private connection: Connection;
@@ -29,6 +41,8 @@ export class PositionManager {
     bondingCurveManager: BondingCurveManager,
     config: Partial<PositionManagerConfig> = {}
   ) {
+    super(); // ⭐ Call EventEmitter constructor
+    
     this.connection = connection;
     this.solanaService = solanaService;
     this.bondingCurveManager = bondingCurveManager;
@@ -136,9 +150,23 @@ export class PositionManager {
         // Stop monitoring this position
         this.stopMonitoring(positionId);
       } else {
+        // Update position with current price and emit price update event
+        const pnl = position.calculatePnL(currentPrice);
+        
+        // ⭐ EMIT PRICE UPDATE EVENT for UI
+        this.emit('priceUpdate', {
+          tokenAddress: token.address,
+          tokenSymbol: token.symbol,
+          currentPrice,
+          entryPrice: position.entryPrice,
+          pnl: pnl.unrealizedPnlSol,
+          pnlPercent: pnl.priceChangePercent,
+          amount: position.quantity,
+          solInvested: position.solInvested
+        } as PositionPriceUpdate);
+
         // Log current status (debug level)
         if (this.config.enableLogging) {
-          const pnl = position.calculatePnL(currentPrice);
           console.debug(`📊 ${token.symbol} status: ${currentPrice.toFixed(8)} SOL (${pnl.priceChangePercent > 0 ? '+' : ''}${pnl.priceChangePercent.toFixed(2)}%)`);
         }
       }
@@ -364,8 +392,8 @@ export class PositionManager {
       this.stopMonitoring(positionId);
     }
     
-    // Clear all event listeners
-    this.exitListeners.length = 0;
+    // Clear all event listeners (EventEmitter)
+    this.removeAllListeners();
     
     // Clear positions if force close was requested
     if (forceClosePositions) {
@@ -373,53 +401,5 @@ export class PositionManager {
     }
     
     console.log(`🔌 PositionManager shutdown complete`);
-  }
-
-  // Event emitter for position exit signals
-  private exitListeners: ((data: {
-    position: Position;
-    token: Token;
-    currentPrice: number;
-    exitReason: ExitReason;
-    urgency: string;
-  }) => void)[] = [];
-
-  private emit(event: string, data: {
-    position: Position;
-    token: Token;
-    currentPrice: number;
-    exitReason: ExitReason;
-    urgency: string;
-  }): void {
-    if (event === 'positionExit') {
-      this.exitListeners.forEach(listener => listener(data));
-    }
-  }
-
-  on(event: 'positionExit', listener: (data: {
-    position: Position;
-    token: Token;
-    currentPrice: number;
-    exitReason: ExitReason;
-    urgency: string;
-  }) => void): void {
-    if (event === 'positionExit') {
-      this.exitListeners.push(listener);
-    }
-  }
-
-  off(event: 'positionExit', listener: (data: {
-    position: Position;
-    token: Token;
-    currentPrice: number;
-    exitReason: ExitReason;
-    urgency: string;
-  }) => void): void {
-    if (event === 'positionExit') {
-      const index = this.exitListeners.indexOf(listener);
-      if (index !== -1) {
-        this.exitListeners.splice(index, 1);
-      }
-    }
   }
 }
