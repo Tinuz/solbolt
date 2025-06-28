@@ -156,7 +156,7 @@ export class Position {
 
   /**
    * Calculate profit/loss for position
-   * Enhanced version of Python get_pnl method
+   * Fixed Python-style calculation with correct ROI
    */
   calculatePnL(currentPrice?: number): PnLData {
     if (this.data.isActive && currentPrice === undefined) {
@@ -167,8 +167,12 @@ export class Position {
     
     const priceChange = priceToUse - this.data.entryPrice;
     const priceChangePercent = (priceChange / this.data.entryPrice) * 100;
+    
+    // Python-style PnL calculation: price_change * quantity
+    const unrealizedPnlSol = priceChange * this.data.quantity;
+    
     const currentValue = priceToUse * this.data.quantity;
-    const unrealizedPnlSol = currentValue - this.data.solInvested;
+    // Fixed ROI calculation: (profit / initial investment) * 100
     const roi = (unrealizedPnlSol / this.data.solInvested) * 100;
 
     return {

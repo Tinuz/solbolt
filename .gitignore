@@ -39,3 +39,35 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Test files and temporary scripts
+test-*.ts
+test-*.js
+*-test.ts
+*-test.js
+
+# Sell test scripts and trading scripts
+src/scripts/sellAllTokens.ts
+src/scripts/sellPink.ts
+src/scripts/manualSell.ts
+sellAllTokens.js
+sellPink.js
+sell*.ts
+sell*.js
+manual*.ts
+manual*.js
+
+# Python bot and related files
+python_bot/
+*.py
+pyproject.toml
+learning-examples/
+idl/
+bots/
+trades/
+
+# Temporary and development files
+temp/
+tmp/
+.temp
+.tmp

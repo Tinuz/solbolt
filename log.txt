@@ -1,0 +1,90 @@
+❌ No trading signal generated for MOONMOON (evaluateToken returned null) pumpFunBot.ts:281:23
+🔍 Check autonomous trading logs above for specific rejection reason pumpFunBot.ts:282:23
+⚠️ Bonding curve account AJjLZcaaNBKpg11QG9agpgKxnuBCamKR1ojuC5mP9CYJ has no data (possibly migrated to Raydium) solana.ts:232:17
+🔄 No bonding curve data available - token likely migrated to Raydium autonomousTrading.ts:156:21
+❌ REJECTION REASON: Cannot trade SHORK - bonding curve has no data (migrated to Raydium) autonomousTrading.ts:157:21
+❌ No trading signal generated for SHORK (evaluateToken returned null) pumpFunBot.ts:281:23
+🔍 Check autonomous trading logs above for specific rejection reason pumpFunBot.ts:282:23
+🔍 New token detected: MOONCAINE MOONCAINE tokenMonitor.ts:23:17
+🔍 Token detected: MOONCAINE useBot.ts:80:15
+🔎 PumpFunBot: Pre-filtering token MOONCAINE: 
+Object { symbol: "MOONCAINE", address: "FpkYaoHpbTT7FHjpbmjapGmDeuJBVdmwh9hGgo3Bpump", createdOn: 1751132807277, currentTime: 1751132807278 }
+pumpFunBot.ts:211:13
+📅 Token age check: 0.00 minutes (max: 30 minutes) pumpFunBot.ts:220:13
+💼 Position check: NONE pumpFunBot.ts:228:13
+📊 Position limit check: 0/5 pumpFunBot.ts:236:13
+✅ Token MOONCAINE passed pre-filter - sending to autonomous trading pumpFunBot.ts:242:13
+🔍 PumpFunBot: Evaluating new token: MOONCAINE (MOONCAINE) pumpFunBot.ts:248:15
+📊 Bot config: 
+Object { enabled: true, maxTokenAge: 30, maxPositions: 5, buyAmount: 0.01 }
+pumpFunBot.ts:249:15
+🤖 Autonomous trading status: 
+Object { exists: true, isActive: true }
+pumpFunBot.ts:255:15
+🤖 Evaluating token for autonomous trading: MOONCAINE pumpFunBot.ts:262:17
+🔍 Evaluating token for autonomous trading: MOONCAINE autonomousTrading.ts:96:15
+📊 Token details: 
+Object { symbol: "MOONCAINE", address: "FpkYaoHpbTT7FHjpbmjapGmDeuJBVdmwh9hGgo3Bpump", createdOn: "2025-06-28T17:46:47.277Z", ageMs: 1, ageSec: 0.001, price: 2.966359705183272e-8, liquidity: 29.66359705183272, bondingCurve: "HqS7YLSUqBVnRnGP2Keh7xhwr8wMR4zauAXwTGfcuwgb" }
+autonomousTrading.ts:97:15
+📈 Position check: 0/5 positions autonomousTrading.ts:110:15
+📅 Token age check: 0.001s (min required: 0.001s, max allowed: 1800s) autonomousTrading.ts:121:15
+💧 Liquidity check starting... autonomousTrading.ts:137:15
+🔍 Checking bonding curve: HqS7YLSUqBVnRnGP2Keh7xhwr8wMR4zauAXwTGfcuwgb autonomousTrading.ts:141:19
+🔍 Fetching bonding curve data: HqS7YLSUqBVnRnGP2Keh7xhwr8wMR4zauAXwTGfcuwgb solana.ts:214:15
+🔍 Fetching bonding curve state: HqS7YLSUqBVnRnGP2Keh7xhwr8wMR4zauAXwTGfcuwgb manager.ts:24:15
+⚠️ Bonding curve account HqS7YLSUqBVnRnGP2Keh7xhwr8wMR4zauAXwTGfcuwgb has no data (possibly migrated to Raydium) solana.ts:232:17
+🔄 No bonding curve data available - token likely migrated to Raydium autonomousTrading.ts:156:21
+❌ REJECTION REASON: Cannot trade MOONCAINE - bonding curve has no data (migrated to Raydium) autonomousTrading.ts:157:21
+❌ No trading signal generated for MOONCAINE (evaluateToken returned null) pumpFunBot.ts:281:23
+🔍 Check autonomous trading logs above for specific rejection reason pumpFunBot.ts:282:23
+🔍 New token detected: BattleCoin Jeets vs Holders tokenMonitor.ts:23:17
+🔍 Token detected: BattleCoin useBot.ts:80:15
+🔎 PumpFunBot: Pre-filtering token BattleCoin: 
+Object { symbol: "BattleCoin", address: "CBHXxwJBpEyZPboeXxeysc3geC4mDMp79p3kZqYXpump", createdOn: 1751132808860, currentTime: 1751132808861 }
+pumpFunBot.ts:211:13
+📅 Token age check: 0.00 minutes (max: 30 minutes) pumpFunBot.ts:220:13
+💼 Position check: NONE pumpFunBot.ts:228:13
+📊 Position limit check: 0/5 pumpFunBot.ts:236:13
+✅ Token BattleCoin passed pre-filter - sending to autonomous trading pumpFunBot.ts:242:13
+🔍 PumpFunBot: Evaluating new token: BattleCoin (Jeets vs Holders) pumpFunBot.ts:248:15
+📊 Bot config: 
+Object { enabled: true, maxTokenAge: 30, maxPositions: 5, buyAmount: 0.01 }
+pumpFunBot.ts:249:15
+🤖 Autonomous trading status: 
+Object { exists: true, isActive: true }
+pumpFunBot.ts:255:15
+🤖 Evaluating token for autonomous trading: BattleCoin pumpFunBot.ts:262:17
+🔍 Evaluating token for autonomous trading: BattleCoin autonomousTrading.ts:96:15
+📊 Token details: 
+Object { symbol: "BattleCoin", address: "CBHXxwJBpEyZPboeXxeysc3geC4mDMp79p3kZqYXpump", createdOn: "2025-06-28T17:46:48.860Z", ageMs: 1, ageSec: 0.001, price: 3.177176344623955e-8, liquidity: 31.77176344623955, bondingCurve: "FuRwKhdazQybggJs7DL8kx6Ya7VSVsDbqFkCd8HuDLAg" }
+autonomousTrading.ts:97:15
+📈 Position check: 0/5 positions autonomousTrading.ts:110:15
+📅 Token age check: 0.002s (min required: 0.001s, max allowed: 1800s) autonomousTrading.ts:121:15
+💧 Liquidity check starting... autonomousTrading.ts:137:15
+🔍 Checking bonding curve: FuRwKhdazQybggJs7DL8kx6Ya7VSVsDbqFkCd8HuDLAg autonomousTrading.ts:141:19
+🔍 Fetching bonding curve data: FuRwKhdazQybggJs7DL8kx6Ya7VSVsDbqFkCd8HuDLAg solana.ts:214:15
+🔍 Fetching bonding curve state: FuRwKhdazQybggJs7DL8kx6Ya7VSVsDbqFkCd8HuDLAg manager.ts:24:15
+⚠️ Bonding curve account FuRwKhdazQybggJs7DL8kx6Ya7VSVsDbqFkCd8HuDLAg has no data (possibly migrated to Raydium) solana.ts:232:17
+🔄 No bonding curve data available - token likely migrated to Raydium autonomousTrading.ts:156:21
+❌ REJECTION REASON: Cannot trade BattleCoin - bonding curve has no data (migrated to Raydium) autonomousTrading.ts:157:21
+❌ No trading signal generated for BattleCoin (evaluateToken returned null) pumpFunBot.ts:281:23
+🔍 Check autonomous trading logs above for specific rejection reason pumpFunBot.ts:282:23
+❌ Transaction confirmation: 2KWbz78zy3DYmd1SvUJexWPvTjKY5LvSirS1F2roDWHzPNa8YdK5vf9gEerNTuVhijw62E6hFypXgZdMr5ASbjPa autonomousWallet.ts:116:15
+❌ Failed to buy VCXVX: 2KWbz78zy3DYmd1SvUJexWPvTjKY5LvSirS1F2roDWHzPNa8YdK5vf9gEerNTuVhijw62E6hFypXgZdMr5ASbjPa trading.ts:219:17
+🤖 Autonomous trade executed for VCXVX autonomousTrading.ts:230:17
+
+
+​
+
+Received JSON-RPC error calling `signatureSubscribe` 
+Object { args: (2) […], error: {…} }
+intercept-console-error.ts:40:26
+Received JSON-RPC error calling `signatureSubscribe` 
+Object { args: (2) […], error: {…} }
+intercept-console-error.ts:40:26
+Received JSON-RPC error calling `signatureSubscribe` 
+Object { args: (2) […], error: {…} }
+intercept-console-error.ts:40:26
+Received JSON-RPC error calling `signatureSubscribe` 
+Object { args: (2) […], error: {…} }
+intercept-console-error.ts:40:26

@@ -1,6 +1,7 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { BondingCurveManager, BondingCurveData } from './bondingCurve';
 import { PriorityFeeManager, PriorityFeeConfig } from './priorityFee';
+import { rpcRateLimiter, RPCRateLimiter } from './rpcRateLimiter'; // ADDED rate limiter
 import { configService } from './config';
 
 export const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -17,6 +18,7 @@ export class SolanaService {
   private connection: Connection;
   private bondingCurveManager: BondingCurveManager;
   private priorityFeeManager: PriorityFeeManager;
+  private rateLimiter: RPCRateLimiter; // ADDED rate limiter instance
   private fallbackEndpoints: string[] = [
     'https://solana-mainnet.core.chainstack.com/69600811e0e036c9e11cecaecc1f1843',
     'https://mainnet.helius-rpc.com/?api-key=a360743f-773d-430c-afcd-70370fd20b87'
@@ -41,7 +43,21 @@ export class SolanaService {
       final: endpoint 
     });
     
-    this.connection = new Connection(endpoint, 'confirmed');
+    this.connection = new Connection(endpoint, {
+      commitment: 'confirmed',
+      httpHeaders: {
+        'User-Agent': 'SolBot-v3/1.0'
+      },
+      // Optimize for Chainstack limits and avoid WebSocket issues
+      confirmTransactionInitialTimeout: 60000,  // 60 seconds
+      disableRetryOnRateLimit: false,           // Let our rate limiter handle retries
+      wsEndpoint: undefined,                    // Disable WebSocket to prevent subscription errors
+      fetch: undefined                          // Use default fetch with our rate limiting
+    });
+    
+    // Initialize rate limiter - ADDED
+    this.rateLimiter = rpcRateLimiter;
+    console.log(`🚦 Rate limiter initialized:`, this.rateLimiter.getStats());
     
     // Initialize managers
     this.bondingCurveManager = new BondingCurveManager(this.connection);
@@ -58,6 +74,34 @@ export class SolanaService {
     
     console.log(`🔗 Connected to Solana RPC: ${endpoint}`);
     console.log(`🛠️ Initialized production-grade managers`);
+    
+    // Start periodic rate limit monitoring for Chainstack
+    this.startRateLimitMonitoring();
+  }
+
+  /**
+   * Check if we're close to Chainstack rate limit before heavy operations
+   */
+  async checkRateLimitBeforeHeavyOperation(): Promise<boolean> {
+    const stats = this.rateLimiter.getStats();
+    const utilizationPercent = (stats.requestsInLastSecond / 25) * 100;
+    
+    if (utilizationPercent > 90) {
+      console.warn(`🚫 Skipping operation - too close to Chainstack limit: ${utilizationPercent.toFixed(1)}%`);
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Start monitoring Chainstack rate limit usage
+   */
+  private startRateLimitMonitoring(): void {
+    setInterval(() => {
+      this.rateLimiter.logRateLimitStatus();
+    }, 10000); // Log every 10 seconds
+    console.log(`📊 Chainstack rate limit monitoring started (25 RPS limit)`);
   }
 
   getConnection(): Connection {
@@ -176,7 +220,11 @@ export class SolanaService {
   async getTokenInfo(tokenAddress: string): Promise<any> {
     try {
       const tokenPubkey = new PublicKey(tokenAddress);
-      const accountInfo = await this.connection.getAccountInfo(tokenPubkey);
+      // ADDED: Rate limited RPC call
+      const accountInfo = await this.rateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(tokenPubkey),
+        `getAccountInfo(${tokenAddress.substring(0, 8)}...)`
+      );
       return accountInfo;
     } catch (error) {
       console.error('Error fetching token info:', error);
@@ -187,7 +235,11 @@ export class SolanaService {
   async getWalletBalance(walletAddress: string): Promise<number> {
     try {
       const publicKey = new PublicKey(walletAddress);
-      const balance = await this.connection.getBalance(publicKey);
+      // ADDED: Rate limited RPC call
+      const balance = await this.rateLimiter.executeRPCCall(
+        () => this.connection.getBalance(publicKey),
+        `getBalance(${walletAddress.substring(0, 8)}...)`
+      );
       return balance / 1e9; // Convert lamports to SOL
     } catch (error) {
       console.error('Error fetching wallet balance:', error);
@@ -228,7 +280,11 @@ export class SolanaService {
 
   async simulateTransaction(transaction: any): Promise<any> {
     try {
-      const simulation = await this.connection.simulateTransaction(transaction);
+      // ADDED: Rate limited transaction simulation
+      const simulation = await this.rateLimiter.executeRPCCall(
+        () => this.connection.simulateTransaction(transaction),
+        'simulateTransaction'
+      );
       return simulation;
     } catch (error) {
       console.error('Error simulating transaction:', error);
@@ -257,6 +313,76 @@ export class SolanaService {
       const fallbackFee = 20000; // 20k micro-lamports for production
       console.log(`💰 Using ultimate fallback priority fee: ${fallbackFee} micro-lamports`);
       return fallbackFee;
+    }
+  }
+
+  /**
+   * Robust transaction confirmation that avoids WebSocket issues
+   * Uses polling instead of subscriptions for better reliability with Chainstack
+   */
+  async confirmTransactionRobust(signature: string): Promise<boolean> {
+    try {
+      console.log(`🔍 Robust confirmation for transaction: ${signature}`);
+      
+      // Use environment variables for configuration
+      const maxPollingAttempts = 20;
+      const pollInterval = parseInt(process.env.CONFIRMATION_POLL_INTERVAL || '3000');
+      const timeoutMs = parseInt(process.env.CONFIRMATION_TIMEOUT || '60000');
+      
+      const startTime = Date.now();
+      
+      for (let attempt = 1; attempt <= maxPollingAttempts; attempt++) {
+        // Check timeout
+        if (Date.now() - startTime > timeoutMs) {
+          console.warn(`⏰ Confirmation timeout after ${timeoutMs}ms for: ${signature}`);
+          break;
+        }
+        
+        try {
+          const response = await this.rateLimiter.executeRPCCall(
+            () => this.connection.getSignatureStatus(signature, {
+              searchTransactionHistory: true
+            }),
+            `confirmTransactionRobust(poll ${attempt})`
+          );
+
+          if (response.value) {
+            const status = response.value;
+            
+            if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+              const success = !status.err;
+              console.log(`${success ? '✅' : '❌'} Transaction confirmed via polling: ${signature}`);
+              if (status.err) {
+                console.error(`Transaction error:`, status.err);
+              }
+              return success;
+            }
+            
+            console.log(`⏳ Polling attempt ${attempt}/${maxPollingAttempts}: ${status.confirmationStatus || 'pending'}`);
+          } else {
+            console.log(`⏳ Transaction not found yet (attempt ${attempt}/${maxPollingAttempts})`);
+          }
+          
+          if (attempt < maxPollingAttempts) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+          }
+          
+        } catch (pollError) {
+          console.warn(`⚠️ Polling attempt ${attempt} failed:`, pollError);
+          
+          // Wait before retry
+          if (attempt < maxPollingAttempts) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+          }
+        }
+      }
+      
+      console.warn(`⚠️ Transaction confirmation timeout via polling: ${signature}`);
+      return false;
+
+    } catch (error) {
+      console.error('❌ Robust confirmation failed:', error);
+      return false;
     }
   }
 

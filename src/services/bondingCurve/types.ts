@@ -10,8 +10,9 @@ export const LAMPORTS_PER_SOL = 1_000_000_000;
 export const TOKEN_DECIMALS = 6;
 
 // Discriminator for bonding curve account (from Python)
+// struct.pack("<Q", 6966180631402821399) = 17b7f83760d8ac60
 export const BONDING_CURVE_DISCRIMINATOR = Buffer.from([
-  0x17, 0xb7, 0xd1, 0x36, 0x28, 0x18, 0x5a, 0x60
+  0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60
 ]); // 6966180631402821399 as little-endian bytes
 
 export interface BondingCurveState {

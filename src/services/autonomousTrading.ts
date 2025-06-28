@@ -79,7 +79,7 @@ export class AutonomousTradingManager {
     );
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (!this.isRunning) return;
     
     this.isRunning = false;
@@ -89,6 +89,12 @@ export class AutonomousTradingManager {
       clearInterval(this.priceCheckInterval);
       this.priceCheckInterval = null;
     }
+
+    // Shutdown trading service and close all positions
+    console.log('🔌 Shutting down trading service and closing all positions...');
+    await this.tradingService.shutdown();
+    
+    console.log('✅ Autonomous trading stopped and all positions closed');
   }
 
   async evaluateToken(token: Token, wallet: WalletContextState): Promise<TradingSignal | null> {
@@ -153,43 +159,31 @@ export class AutonomousTradingManager {
               console.log(`✅ Liquidity sufficient: ${curveData.solReserves.toFixed(6)} >= ${this.config.minLiquidity} SOL`);
             }
           } else {
-            console.log(`🔄 No bonding curve data available, using token.liquidity: ${token.liquidity}`);
-            
-            // Use token liquidity when curve data is not available
-            if (token.liquidity < this.config.minLiquidity) {
-              console.log(`⚠️ Insufficient token liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
-              liquidityCheck = false;
-            } else {
-              console.log(`✅ Token liquidity sufficient: ${token.liquidity} >= ${this.config.minLiquidity}`);
-            }
+            console.log(`🔄 No bonding curve data available - token likely migrated to Raydium`);
+            console.log(`❌ REJECTION REASON: Cannot trade ${token.symbol} - bonding curve has no data (migrated to Raydium)`);
+            return null;
           }
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : 'Unknown error';
           
           if (errorMessage.includes('Invalid bonding curve discriminator')) {
             console.warn(`⚠️ Token ${token.symbol} has invalid bonding curve format - possibly not a pump.fun token`);
-          } else if (errorMessage.includes('No data in bonding curve account')) {
-            console.warn(`⚠️ Token ${token.symbol} bonding curve account is empty - possibly migrated or invalid`);
+            console.log(`❌ REJECTION REASON: Invalid bonding curve format for ${token.symbol}`);
+            return null;
+          } else if (errorMessage.includes('No data in bonding curve account') || errorMessage.includes('Empty bonding curve account')) {
+            console.warn(`⚠️ Token ${token.symbol} bonding curve account is empty - possibly migrated to Raydium`);
+            console.log(`❌ REJECTION REASON: Bonding curve empty for ${token.symbol} (migrated to Raydium)`);
+            return null;
           } else {
             console.warn(`⚠️ Could not check bonding curve liquidity for ${token.symbol}:`, errorMessage);
-          }
-          
-          console.log(`🔄 Falling back to token.liquidity check due to bonding curve error...`);
-          
-          // Fallback to token liquidity when bonding curve fails
-          if (token.liquidity < this.config.minLiquidity) {
-            console.log(`⚠️ Insufficient fallback liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
-            liquidityCheck = false;
-          } else {
-            console.log(`✅ Fallback liquidity sufficient: ${token.liquidity} >= ${this.config.minLiquidity}`);
+            console.log(`❌ REJECTION REASON: Bonding curve error for ${token.symbol}: ${errorMessage}`);
+            return null;
           }
         }
       } else {
-        console.log(`🔄 No bonding curve provided, using token.liquidity: ${token.liquidity}`);
-        if (token.liquidity < this.config.minLiquidity) {
-          console.log(`⚠️ Insufficient token liquidity: ${token.liquidity} < ${this.config.minLiquidity}`);
-          liquidityCheck = false;
-        }
+        console.log(`❌ No bonding curve provided - cannot trade token without pump.fun bonding curve`);
+        console.log(`❌ REJECTION REASON: No bonding curve for ${token.symbol}`);
+        return null;
       }
 
       if (!liquidityCheck) {
@@ -229,12 +223,29 @@ export class AutonomousTradingManager {
     try {
       console.log(`🚀 PRODUCTION BUY: ${token.symbol} for ${this.config.buyAmount} SOL`);
 
-      const trade = await this.tradingService.buyToken(
-        token,
-        wallet,
-        this.config.buyAmount,
-        this.config.maxSlippage
-      );
+      // Try autonomous trading first if available, fallback to browser wallet
+      let trade: Trade | null = null;
+      
+      try {
+        // First attempt: Use autonomous wallet for seamless trading
+        trade = await this.tradingService.buyTokenAutonomous(
+          token,
+          this.config.buyAmount,
+          this.config.maxSlippage
+        );
+        console.log(`🤖 Autonomous trade executed for ${token.symbol}`);
+      } catch (autonomousError) {
+        console.log(`⚠️ Autonomous trading not available, falling back to browser wallet:`, autonomousError);
+        
+        // Fallback: Use browser wallet (requires manual approval)
+        trade = await this.tradingService.buyToken(
+          token,
+          wallet,
+          this.config.buyAmount,
+          this.config.maxSlippage
+        );
+        console.log(`📱 Browser wallet trade executed for ${token.symbol}`);
+      }
 
       if (trade && trade.status === 'success') {
         // Create position with production-grade configuration

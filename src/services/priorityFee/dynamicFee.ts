@@ -1,6 +1,6 @@
 /**
- * Dynamic Priority Fee Plugin
- * Uses getRecentPrioritizationFees with 70th percentile like Python implementation
+ * Dynamic Priority Fee Calculator
+ * Fetches real-time priority fees from Solana network
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -13,34 +13,35 @@ export class DynamicPriorityFee implements PriorityFeePlugin {
     this.connection = connection;
   }
 
+  /**
+   * Get dynamic priority fee based on network conditions
+   * Returns fee in micro-lamports
+   */
   async getPriorityFee(accounts?: PublicKey[]): Promise<number | null> {
     try {
-      console.log('🔍 Fetching dynamic priority fees...');
+      console.log(`🔍 Fetching dynamic priority fees...`);
       
-      // Get recent prioritization fees
-      const recentFees = await this.connection.getRecentPrioritizationFees({
-        lockedWritableAccounts: accounts,
+      // Get recent priority fee statistics
+      const recentPriorityFees = await this.connection.getRecentPrioritizationFees({
+        lockedWritableAccounts: accounts
       });
 
-      if (!recentFees || recentFees.length === 0) {
-        console.warn('⚠️ No prioritization fees found in response');
+      if (!recentPriorityFees || recentPriorityFees.length === 0) {
+        console.warn('⚠️ No recent priority fee data available');
         return null;
       }
 
-      // Extract fees array
-      const fees = recentFees.map(fee => fee.prioritizationFee);
+      // Calculate 70th percentile (recommended for fast confirmation)
+      const fees = recentPriorityFees
+        .map(fee => fee.prioritizationFee)
+        .sort((a, b) => a - b);
       
-      if (fees.length === 0) {
-        console.warn('⚠️ No valid fees in response');
-        return null;
-      }
+      const percentileIndex = Math.floor(fees.length * 0.70);
+      const dynamicFee = fees[percentileIndex] || 0;
 
-      // Calculate 70th percentile like Python (faster processing but higher fee)
-      // This means you're paying more than 70% of other transactions
-      const priorityFee = this.calculatePercentile(fees, 70);
+      console.log(`💰 Dynamic priority fee (70th percentile): ${dynamicFee} micro-lamports`);
       
-      console.log(`💰 Dynamic priority fee (70th percentile): ${priorityFee} micro-lamports`);
-      return priorityFee;
+      return dynamicFee;
 
     } catch (error) {
       console.error('❌ Failed to fetch dynamic priority fee:', error);
@@ -48,27 +49,36 @@ export class DynamicPriorityFee implements PriorityFeePlugin {
     }
   }
 
-  private calculatePercentile(fees: number[], percentile: number): number {
-    // Sort fees in ascending order
-    const sortedFees = [...fees].sort((a, b) => a - b);
-    
-    if (sortedFees.length === 0) return 0;
-    if (sortedFees.length === 1) return sortedFees[0];
-    
-    // Calculate index for percentile
-    const index = (percentile / 100) * (sortedFees.length - 1);
-    
-    if (Number.isInteger(index)) {
-      return sortedFees[index];
+  /**
+   * Get priority fee for specific accounts
+   */
+  async getPriorityFeeForAccounts(accounts: PublicKey[]): Promise<number | null> {
+    return this.getPriorityFee(accounts);
+  }
+
+  /**
+   * Get recommended priority fee based on urgency
+   */
+  async getRecommendedFee(urgency: 'low' | 'medium' | 'high' = 'medium'): Promise<number | null> {
+    try {
+      const baseFee = await this.getPriorityFee();
+      if (baseFee === null) return null;
+
+      // Apply urgency multiplier
+      const multipliers = {
+        low: 1.0,     // Use base fee
+        medium: 1.5,  // 50% higher
+        high: 2.0     // 100% higher
+      };
+
+      const recommendedFee = Math.round(baseFee * multipliers[urgency]);
+      console.log(`⚡ Recommended fee for ${urgency} urgency: ${recommendedFee} micro-lamports`);
+      
+      return recommendedFee;
+
+    } catch (error) {
+      console.error('❌ Failed to calculate recommended fee:', error);
+      return null;
     }
-    
-    // Interpolate between values
-    const lower = Math.floor(index);
-    const upper = Math.ceil(index);
-    const weight = index - lower;
-    
-    return Math.round(
-      sortedFees[lower] * (1 - weight) + sortedFees[upper] * weight
-    );
   }
 }

@@ -6,7 +6,9 @@
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "sell-all": "npx tsx src/scripts/sellAllTokens.ts",
+    "check-tokens": "node sellAllTokens.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
@@ -21,6 +23,7 @@
     "@types/bs58": "^4.0.4",
     "bn.js": "^5.2.2",
     "bs58": "^6.0.0",
+    "dotenv": "^17.0.0",
     "lucide-react": "^0.523.0",
     "next": "15.3.4",
     "react": "^19.0.0",

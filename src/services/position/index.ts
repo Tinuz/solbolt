@@ -3,6 +3,7 @@
  */
 
 export { Position } from './Position';
+export { PositionManager } from './PositionManager';
 export type { 
   PositionData, 
   PositionConfig, 

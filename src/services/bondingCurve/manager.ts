@@ -6,6 +6,7 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { BondingCurveState, BondingCurveData } from './types';
 import { BondingCurveStateParser } from './parser';
+import { rpcRateLimiter } from '../rpcRateLimiter'; // ADDED rate limiter
 
 export class BondingCurveManager {
   private connection: Connection;
@@ -16,13 +17,17 @@ export class BondingCurveManager {
 
   /**
    * Get bonding curve state from on-chain account
-   * Mirrors Python get_curve_state method
+   * Mirrors Python get_curve_state method - NOW WITH RATE LIMITING
    */
   async getCurveState(curveAddress: PublicKey): Promise<BondingCurveState> {
     try {
       console.log(`🔍 Fetching bonding curve state: ${curveAddress.toString()}`);
       
-      const accountInfo = await this.connection.getAccountInfo(curveAddress);
+      // ADDED: Rate limited RPC call
+      const accountInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(curveAddress),
+        `getBondingCurve(${curveAddress.toString().substring(0, 8)}...)`
+      );
       
       if (!accountInfo || !accountInfo.data) {
         throw new Error(`No data in bonding curve account ${curveAddress.toString()}`);

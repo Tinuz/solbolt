@@ -19,22 +19,310 @@ import {
   createAssociatedTokenAccountInstruction,
   calculatePumpFunAccounts
 } from './pumpFunInstructions';
+import { rpcRateLimiter } from './rpcRateLimiter';
+import { AutonomousWallet, AutonomousWalletAdapter } from './autonomousWallet';
+import { PositionManager } from './position/PositionManager';
+import { BondingCurveManager } from './bondingCurve/manager';
+import { ExitReason } from './position/types';
 import { BN } from 'bn.js';
+
+// Extended wallet interface that supports both browser wallets and autonomous wallet
+type ExtendedWalletState = WalletContextState | AutonomousWalletAdapter;
 
 export class TradingService {
   private solanaService: SolanaService;
   private connection: Connection;
   private idlService: PumpFunIdlService;
   private useIdlService: boolean;
+  private autonomousWallet: AutonomousWallet | null = null;
+  private positionManager: PositionManager | null = null;
 
   constructor(connection: Connection, useIdlService: boolean = true) {
     this.connection = connection;
-    // Use the same connection endpoint to ensure consistency
     const endpoint = connection.rpcEndpoint;
     console.log(`🔗 TradingService: Using RPC endpoint from connection: ${endpoint}`);
     this.solanaService = new SolanaService(endpoint);
     this.idlService = new PumpFunIdlService(connection);
     this.useIdlService = useIdlService;
+    
+    // Initialize autonomous wallet if configured
+    this.autonomousWallet = AutonomousWallet.fromEnvironment(connection);
+    if (this.autonomousWallet) {
+      console.log(`🤖 Autonomous trading wallet available: ${this.autonomousWallet.publicKey.toString()}`);
+      this.autonomousWallet.testConnection().then(success => {
+        if (success) {
+          console.log(`✅ Autonomous wallet test successful - ready for programmatic trading`);
+        } else {
+          console.log(`❌ Autonomous wallet test failed - may have connection issues`);
+        }
+      }).catch(error => {
+        console.log(`❌ Autonomous wallet test error:`, error);
+      });
+    } else {
+      console.log(`⚠️ Autonomous wallet not configured - browser wallet will be used (requires manual approval)`);
+    }
+
+    // Initialize position manager if autonomous wallet is available
+    this.initializePositionManager();
+  }
+
+  private initializePositionManager(): void {
+    if (!this.autonomousWallet) {
+      console.log(`⚠️ Position management disabled - requires autonomous wallet`);
+      return;
+    }
+
+    try {
+      const bondingCurveManager = new BondingCurveManager(this.connection);
+      
+      this.positionManager = new PositionManager(
+        this.connection,
+        this.solanaService,
+        bondingCurveManager,
+        {
+          priceCheckInterval: 10, // Check every 10 seconds like Python
+          enableLogging: true
+        }
+      );
+
+      // Listen for position exit signals
+      this.positionManager.on('positionExit', async (data) => {
+        await this.handlePositionExit(data);
+      });
+
+      console.log(`📊 Position management enabled with 10s monitoring interval`);
+    } catch (error) {
+      console.error(`❌ Failed to initialize position manager:`, error);
+    }
+  }
+
+  /**
+   * Handle position exit signal from PositionManager
+   * Mirrors Python's sell execution in monitoring loop
+   */
+  private async handlePositionExit(data: {
+    position: any;
+    token: Token;
+    currentPrice: number;
+    exitReason: ExitReason;
+    urgency: string;
+  }): Promise<void> {
+    const { position, token, currentPrice, exitReason, urgency } = data;
+    
+    console.log(`🚨 Executing position exit: ${token.symbol} (${exitReason}, ${urgency} urgency)`);
+    
+    try {
+      // Execute sell transaction
+      const sellResult = await this.sellTokenAutonomous(token);
+      
+      if (sellResult) {
+        // Close position with actual exit price
+        this.positionManager?.closePosition(
+          token.address,
+          sellResult.price,
+          exitReason,
+          sellResult.signature
+        );
+        
+        console.log(`✅ Successfully exited position: ${token.symbol} - ${exitReason}`);
+      } else {
+        console.error(`❌ Failed to exit position: ${token.symbol}`);
+        // Position manager will continue monitoring for retry
+      }
+    } catch (error) {
+      console.error(`❌ Error executing position exit:`, error);
+    }
+  }
+
+  private getAutonomousWallet(): AutonomousWalletAdapter | null {
+    if (!this.autonomousWallet) return null;
+    return new AutonomousWalletAdapter(this.autonomousWallet);
+  }
+
+  async buyTokenAutonomous(
+    token: Token,
+    amount: number,
+    slippage: number = 5
+  ): Promise<Trade | null> {
+    const autonomousWallet = this.getAutonomousWallet();
+    if (!autonomousWallet) {
+      throw new Error('Autonomous wallet not configured. Set NEXT_PUBLIC_AUTONOMOUS_PRIVATE_KEY environment variable.');
+    }
+
+    console.log(`🤖 AUTONOMOUS BUY: ${token.symbol} for ${amount} SOL`);
+    const trade = await this.executeBuy(token, autonomousWallet, amount, slippage);
+    
+    // Create position if trade was successful and position manager is available
+    if (trade && trade.status === 'success' && this.positionManager) {
+      // Get position config from environment or defaults
+      const positionConfig = this.getPositionConfig();
+      
+      // Calculate quantity and entry price
+      const curveData = await this.solanaService.getBondingCurveData(token.bondingCurve);
+      const entryPrice = curveData?.price || trade.price;
+      const quantity = amount / entryPrice;
+      
+      const position = this.positionManager.createPosition(
+        token,
+        entryPrice,
+        quantity,
+        amount, // SOL invested
+        positionConfig,
+        trade.signature
+      );
+      
+      console.log(`📊 Position created and monitoring started: ${position.toString()}`);
+    }
+    
+    return trade;
+  }
+
+  async sellTokenAutonomous(
+    token: Token,
+    slippage: number = 5
+  ): Promise<Trade | null> {
+    const autonomousWallet = this.getAutonomousWallet();
+    if (!autonomousWallet) {
+      throw new Error('Autonomous wallet not configured. Set NEXT_PUBLIC_AUTONOMOUS_PRIVATE_KEY environment variable.');
+    }
+
+    console.log(`🤖 AUTONOMOUS SELL: ${token.symbol}`);
+    return this.executeSell(token, autonomousWallet, slippage);
+  }
+
+  /**
+   * Get position configuration from environment variables or defaults
+   */
+  private getPositionConfig() {
+    return {
+      takeProfitPercentage: parseFloat(process.env.NEXT_PUBLIC_TAKE_PROFIT_PERCENTAGE || '0.2'), // 20%
+      stopLossPercentage: parseFloat(process.env.NEXT_PUBLIC_STOP_LOSS_PERCENTAGE || '0.1'),   // 10%
+      maxHoldTime: parseInt(process.env.NEXT_PUBLIC_MAX_HOLD_TIME || '300'), // 5 minutes default
+    };
+  }
+
+  /**
+   * Shutdown trading service and close all positions
+   * Enhanced with actual token selling - DIRECT APPROACH
+   */
+  async shutdown(): Promise<void> {
+    console.log(`🔌 TradingService shutdown initiated...`);
+    
+    if (this.positionManager) {
+      // Get all active positions BEFORE any shutdown actions
+      const activePositions = this.positionManager.getActivePositions();
+      
+      if (activePositions.length > 0) {
+        console.log(`💰 Found ${activePositions.length} active position(s) to sell during shutdown`);
+        
+        // DIRECT SELLING APPROACH - bypass event system during shutdown
+        for (const position of activePositions) {
+          try {
+            console.log(`🔄 DIRECT SELLING: ${position.symbol} (${position.quantity} tokens)...`);
+            
+            // Create basic token object for selling
+            const token = {
+              address: position.mint.toString(),
+              symbol: position.symbol,
+              name: position.name,
+              bondingCurve: '', // Will be calculated by executeSell
+              price: position.entryPrice,
+              marketCap: 0,
+              volume24h: 0,
+              priceChange24h: 0,
+              liquidity: 0,
+              holders: 0,
+              timestamp: Date.now(),
+              description: '',
+              image: '',
+              showName: false,
+              createdOn: Date.now(),
+              twitter: '',
+              telegram: '',
+              website: '',
+              usdMarketCap: 0,
+              complete: false,
+              nsfw: false,
+              mint: position.mint.toString(),
+              creator: '',
+              virtual_sol_reserves: 0,
+              virtual_token_reserves: 0,
+              sol_reserves: 0,
+              token_reserves: 0,
+              associatedBondingCurve: '',
+              progress: 0,
+              virtualSolReserves: 0,
+              virtualTokenReserves: 0
+            } as Token;
+            
+            // DIRECT SELL - no events, no delays
+            if (this.autonomousWallet) {
+              console.log(`🤖 Executing DIRECT autonomous sell for ${position.symbol}...`);
+              
+              const autonomousWalletAdapter = this.getAutonomousWallet();
+              if (autonomousWalletAdapter) {
+                // Execute sell directly
+                const sellResult = await this.executeSell(token, autonomousWalletAdapter, 5);
+                
+                if (sellResult) {
+                  console.log(`✅ DIRECT SELL SUCCESS: ${position.symbol} - ${sellResult.signature}`);
+                  console.log(`💰 Sold ${sellResult.amount} tokens for ${sellResult.price} SOL`);
+                  console.log(`🔗 Transaction: https://solscan.io/tx/${sellResult.signature}`);
+                  
+                  // Close position tracking AFTER successful sell
+                  this.positionManager.closePosition(
+                    token.address,
+                    sellResult.price,
+                    ExitReason.MANUAL,
+                    sellResult.signature
+                  );
+                } else {
+                  console.log(`❌ DIRECT SELL FAILED: ${position.symbol} - transaction returned null`);
+                  console.log(`⚠️ You may need to manually sell these tokens via pump.fun website`);
+                  console.log(`🔗 Token: https://pump.fun/${token.address}`);
+                }
+              } else {
+                console.log(`❌ No autonomous wallet adapter available for ${position.symbol}`);
+              }
+            } else {
+              console.log(`⚠️ Cannot sell ${position.symbol} - no autonomous wallet configured`);
+              
+              // Force close position tracking anyway
+              position.closePosition(position.entryPrice, ExitReason.MANUAL);
+            }
+            
+          } catch (error) {
+            console.error(`❌ Error during DIRECT SELL of ${position.symbol}:`, error);
+            console.log(`⚠️ ${position.symbol} tokens may still be in your wallet`);
+            console.log(`💡 Manual sell options:`);
+            console.log(`   - Via pump.fun: https://pump.fun/${position.mint.toString()}`);
+            console.log(`   - Check token in wallet and sell manually`);
+            
+            // Force close position tracking anyway
+            if (position) {
+              position.closePosition(position.entryPrice, ExitReason.MANUAL);
+            }
+          }
+        }
+        
+        // Give time for any pending transactions to complete
+        console.log(`⏳ Waiting 3 seconds for sell transactions to complete...`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      
+      // Now shutdown position manager (this will stop monitoring)
+      console.log(`📊 Shutting down position manager...`);
+      await this.positionManager.shutdown(false); // Don't emergency close, we already sold
+    }
+    
+    console.log(`🔌 TradingService shutdown complete`);
+  }
+
+  /**
+   * Get position manager (for external access)
+   */
+  getPositionManager(): PositionManager | null {
+    return this.positionManager;
   }
 
   async buyToken(
@@ -56,29 +344,32 @@ export class TradingService {
       throw new Error('Wallet not connected');
     }
 
+    return this.executeBuy(token, wallet, amount, slippage);
+  }
+
+  private async executeBuy(
+    token: Token,
+    wallet: ExtendedWalletState,
+    amount: number,
+    slippage: number
+  ): Promise<Trade | null> {
     try {
       console.log(`🚀 PRODUCTION BUY: ${token.symbol} for ${amount} SOL`);
       
-      // Get production-grade priority fee with relevant accounts
+      // Calculate accounts
+      console.log(`🔧 Calculating bonding curve addresses for ${token.symbol}`);
       const mintPubkey = new PublicKey(token.address);
-      let bondingCurve: PublicKey;
-      let associatedBondingCurve: PublicKey;
-      
-      if (token.bondingCurve && token.associatedBondingCurve) {
-        bondingCurve = new PublicKey(token.bondingCurve);
-        associatedBondingCurve = new PublicKey(token.associatedBondingCurve);
-      } else {
-        console.log(`🔧 Calculating bonding curve addresses for ${token.symbol}`);
-        const accounts = calculatePumpFunAccounts(mintPubkey);
-        bondingCurve = accounts.bondingCurve;
-        associatedBondingCurve = accounts.associatedBondingCurve;
-      }
-      
-      // Get priority fee with relevant accounts for better accuracy
-      const relevantAccounts = [bondingCurve, associatedBondingCurve, mintPubkey];
-      const priorityFee = await this.solanaService.getPriorityFee(relevantAccounts);
-      
-      // Create buy transaction
+      const accounts = calculatePumpFunAccounts(mintPubkey);
+      const bondingCurve = accounts.bondingCurve;
+      const associatedBondingCurve = accounts.associatedBondingCurve;
+
+      // Get priority fee
+      console.log(`🔍 Fetching priority fees with production-grade manager...`);
+      const priorityFeeResult = await this.solanaService.getPriorityFeeManager().calculatePriorityFee();
+      const priorityFee = priorityFeeResult.fee;
+      console.log(`💰 Priority fee result:`, priorityFeeResult);
+
+      // Create transaction
       const transaction = new Transaction();
       
       // Add compute budget instructions with production-grade priority fee
@@ -87,313 +378,101 @@ export class TradingService {
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
       );
       
-      // Calculate bonding curve addresses if not provided (already done above)
+      // Get creator and create buy instructions
+      let creatorPubkey: PublicKey | undefined;
       
-      // Add buy instructions
+      if (token.creator) {
+        creatorPubkey = new PublicKey(token.creator);
+        console.log(`🔑 Using creator from token data: ${creatorPubkey.toString()}`);
+      } else {
+        try {
+          const curveData = await this.solanaService.getBondingCurveData(bondingCurve.toString());
+          if (curveData && curveData.state.creator) {
+            creatorPubkey = curveData.state.creator;
+            console.log(`🔑 Retrieved creator from bonding curve: ${creatorPubkey.toString()}`);
+          } else {
+            console.warn(`⚠️ No creator found in bonding curve data`);
+          }
+        } catch (error) {
+          console.warn(`⚠️ Could not get creator from bonding curve:`, error);
+        }
+      }
+      
       const buyInstructions = await this.createBuyInstruction(
-        wallet.publicKey,
+        wallet.publicKey!,
         mintPubkey,
         bondingCurve,
         associatedBondingCurve,
         amount,
-        slippage
+        slippage,
+        creatorPubkey
       );
       
       buyInstructions.forEach(instruction => transaction.add(instruction));
       
       // Get recent blockhash
-      const { blockhash } = await this.connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      // Simulate transaction first
-      const simulation = await this.connection.simulateTransaction(transaction);
-      
-      if (simulation.value.err) {
-        console.error('Transaction simulation failed:', simulation.value.err);
-        throw new Error('Transaction simulation failed');
-      }
-
-      // Sign transaction
-      const signedTransaction = await wallet.signTransaction(transaction);
-      
-      // Send transaction
-      const signature = await this.connection.sendRawTransaction(
-        signedTransaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
+      const { blockhash } = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getLatestBlockhash(),
+        'getLatestBlockhash'
       );
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey!;
 
-      // Wait for confirmation
-      const confirmation = await this.connection.confirmTransaction({
-        signature,
-        blockhash,
-        lastValidBlockHeight: (await this.connection.getLatestBlockhash()).lastValidBlockHeight,
-      });
+      // Execute transaction based on wallet type
+      let signature: string;
+      
+      if (wallet instanceof AutonomousWalletAdapter && this.autonomousWallet) {
+        console.log(`🤖 Using autonomous wallet transaction sending`);
+        signature = await this.autonomousWallet.sendTransaction(transaction);
+        console.log(`✅ Autonomous transaction sent: ${signature}`);
+        
+        // Confirm transaction
+        const success = await this.autonomousWallet.confirmTransaction(signature);
+        const status = success ? 'success' : 'failed';
+        
+        if (!success) {
+          console.error(`❌ Failed to buy ${token.symbol}: ${signature}`);
+          throw new Error(`Transaction failed: ${signature}`);
+        }
+        
+        console.log(`✅ Successfully bought ${token.symbol}: ${signature}`);
+      } else {
+        console.log(`📱 Using browser wallet (requires manual approval)`);
+        console.log(`📝 Skipping simulation, signing transaction directly (like Python bot)`);
+        
+        const signedTransaction = await wallet.signTransaction!(transaction);
+        signature = await rpcRateLimiter.executeRPCCall(
+          () => this.connection.sendRawTransaction(signedTransaction.serialize(), {
+            skipPreflight: true,
+            preflightCommitment: 'confirmed'
+          }),
+          'sendRawTransaction'
+        );
 
-      const status = confirmation.value.err ? 'failed' : 'success';
+        // Wait for confirmation using robust polling (avoids WebSocket issues)
+        console.log(`⏳ Confirming transaction with robust polling method...`);
+        const success = await this.solanaService.confirmTransactionRobust(signature);
+        const status = success ? 'success' : 'failed';
+      }
 
       const trade: Trade = {
         id: signature,
         tokenAddress: token.address,
         tokenSymbol: token.symbol,
         type: 'buy',
-        amount,
+        amount: amount,
         price: token.price,
         timestamp: Date.now(),
         signature: signature,
-        status
+        status: 'success'
       };
 
-      console.log(`${status === 'success' ? 'Successfully bought' : 'Failed to buy'} ${token.symbol}:`, signature);
       return trade;
 
     } catch (error) {
       console.error(`Error buying ${token.symbol}:`, error);
-      
-      // Return failed trade for tracking
-      const trade: Trade = {
-        id: Date.now().toString(),
-        tokenAddress: token.address,
-        tokenSymbol: token.symbol,
-        type: 'buy',
-        amount,
-        price: token.price,
-        timestamp: Date.now(),
-        signature: '',
-        status: 'failed'
-      };
-      
-      return trade;
+      throw error;
     }
-  }
-
-  async sellToken(
-    token: Token,
-    wallet: WalletContextState,
-    percentage: number = 100,
-    slippage: number = 5
-  ): Promise<Trade | null> {
-    if (!wallet.publicKey || !wallet.signTransaction) {
-      throw new Error('Wallet not connected');
-    }
-
-    try {
-      console.log(`🚀 PRODUCTION SELL: ${percentage}% of ${token.symbol}`);
-      
-      // Get token account balance
-      const sellMintPubkey = new PublicKey(token.address);
-      const tokenAccount = await getAssociatedTokenAddress(sellMintPubkey, wallet.publicKey);
-      
-      const tokenAccountInfo = await this.connection.getTokenAccountBalance(tokenAccount);
-      const tokenBalance = tokenAccountInfo.value.uiAmount || 0;
-      
-      if (tokenBalance === 0) {
-        throw new Error('No tokens to sell');
-      }
-      
-      const sellAmount = (tokenBalance * percentage) / 100;
-      
-      // Calculate bonding curve addresses
-      let sellBondingCurve: PublicKey;
-      let sellAssociatedBondingCurve: PublicKey;
-      
-      if (token.bondingCurve && token.associatedBondingCurve) {
-        sellBondingCurve = new PublicKey(token.bondingCurve);
-        sellAssociatedBondingCurve = new PublicKey(token.associatedBondingCurve);
-      } else {
-        console.log(`🔧 Calculating bonding curve addresses for ${token.symbol}`);
-        const accounts = calculatePumpFunAccounts(sellMintPubkey);
-        sellBondingCurve = accounts.bondingCurve;
-        sellAssociatedBondingCurve = accounts.associatedBondingCurve;
-      }
-      
-      // Get production-grade priority fee with relevant accounts
-      const sellRelevantAccounts = [sellBondingCurve, sellAssociatedBondingCurve, sellMintPubkey];
-      const priorityFee = await this.solanaService.getPriorityFee(sellRelevantAccounts);
-      
-      // Create sell transaction
-      const transaction = new Transaction();
-      
-      // Add compute budget instructions with production-grade priority fee
-      transaction.add(
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
-      );
-      
-      // Add sell instruction
-      const sellInstruction = await this.createSellInstruction(
-        wallet.publicKey,
-        sellMintPubkey,
-        sellBondingCurve,
-        sellAssociatedBondingCurve,
-        sellAmount,
-        slippage
-      );
-      
-      transaction.add(sellInstruction);
-      
-      // Get recent blockhash
-      const { blockhash } = await this.connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      // Simulate transaction first
-      const simulation = await this.connection.simulateTransaction(transaction);
-      
-      if (simulation.value.err) {
-        console.error('Transaction simulation failed:', simulation.value.err);
-        throw new Error('Transaction simulation failed');
-      }
-
-      // Sign transaction
-      const signedTransaction = await wallet.signTransaction(transaction);
-      
-      // Send transaction
-      const signature = await this.connection.sendRawTransaction(
-        signedTransaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
-      );
-
-      // Wait for confirmation
-      const confirmation = await this.connection.confirmTransaction({
-        signature,
-        blockhash,
-        lastValidBlockHeight: (await this.connection.getLatestBlockhash()).lastValidBlockHeight,
-      });
-
-      const status = confirmation.value.err ? 'failed' : 'success';
-
-      const trade: Trade = {
-        id: signature,
-        tokenAddress: token.address,
-        tokenSymbol: token.symbol,
-        type: 'sell',
-        amount: sellAmount,
-        price: token.price,
-        timestamp: Date.now(),
-        signature: signature,
-        status
-      };
-
-      console.log(`${status === 'success' ? 'Successfully sold' : 'Failed to sell'} ${token.symbol}:`, signature);
-      return trade;
-
-    } catch (error) {
-      console.error(`Error selling ${token.symbol}:`, error);
-      
-      // Return failed trade for tracking
-      const trade: Trade = {
-        id: Date.now().toString(),
-        tokenAddress: token.address,
-        tokenSymbol: token.symbol,
-        type: 'sell',
-        amount: 0,
-        price: token.price,
-        timestamp: Date.now(),
-        signature: '',
-        status: 'failed'
-      };
-      
-      return trade;
-    }
-  }
-
-  async shouldBuyToken(token: Token, config: BotConfig): Promise<boolean> {
-    try {
-      // Token age check
-      const tokenAge = (Date.now() - token.createdOn) / 1000; // seconds
-      if (tokenAge > config.maxTokenAge) {
-        console.log(`Token ${token.symbol} too old: ${tokenAge}s > ${config.maxTokenAge}s`);
-        return false;
-      }
-
-      // Market cap check
-      if (token.marketCap > 1000000) { // $1M max
-        console.log(`Token ${token.symbol} market cap too high: $${token.marketCap}`);
-        return false;
-      }
-
-      // Progress check (not graduated to Raydium yet)
-      if (token.progress >= 100 || token.raydiumPool) {
-        console.log(`Token ${token.symbol} already graduated`);
-        return false;
-      }
-
-      // Basic token validation
-      if (!token.name || !token.symbol || token.name.length > 50 || token.symbol.length > 10) {
-        console.log(`Token ${token.symbol} failed basic validation`);
-        return false;
-      }
-
-      // Check for suspicious patterns
-      if (this.isSuspiciousToken(token)) {
-        console.log(`Token ${token.symbol} appears suspicious`);
-        return false;
-      }
-
-      console.log(`Token ${token.symbol} passed all buy criteria`);
-      return true;
-
-    } catch (error) {
-      console.error(`Error evaluating token ${token.symbol}:`, error);
-      return false;
-    }
-  }
-
-  async shouldSellToken(
-    token: Token, 
-    entryPrice: number, 
-    config: BotConfig
-  ): Promise<boolean> {
-    try {
-      const currentPrice = await this.solanaService.getTokenPrice(token.address);
-      const priceChange = ((currentPrice - entryPrice) / entryPrice) * 100;
-
-      // Take profit
-      if (priceChange >= config.takeProfit) {
-        console.log(`Take profit triggered for ${token.symbol}: ${priceChange.toFixed(2)}%`);
-        return true;
-      }
-
-      // Stop loss
-      if (priceChange <= -config.stopLoss) {
-        console.log(`Stop loss triggered for ${token.symbol}: ${priceChange.toFixed(2)}%`);
-        return true;
-      }
-
-      // Check if token graduated (should sell immediately)
-      if (token.progress >= 100 || token.raydiumPool) {
-        console.log(`Token ${token.symbol} graduated - selling`);
-        return true;
-      }
-
-      return false;
-
-    } catch (error) {
-      console.error(`Error evaluating sell for ${token.symbol}:`, error);
-      return false;
-    }
-  }
-
-  private isSuspiciousToken(token: Token): boolean {
-    // Check for suspicious patterns
-    const suspiciousPatterns = [
-      /scam/i,
-      /rugpull/i,
-      /honeypot/i,
-      /test/i,
-      /fake/i,
-    ];
-
-    const text = `${token.name} ${token.symbol} ${token.description}`.toLowerCase();
-    
-    return suspiciousPatterns.some(pattern => pattern.test(text));
   }
 
   private async createBuyInstruction(
@@ -402,21 +481,68 @@ export class TradingService {
     bondingCurve: PublicKey,
     associatedBondingCurve: PublicKey,
     amount: number,
-    slippage: number
+    slippage: number,
+    creator?: PublicKey
   ): Promise<TransactionInstruction[]> {
     const instructions: TransactionInstruction[] = [];
     
-    // Convert amount to lamports and BN
-    const lamports = new BN(amount * LAMPORTS_PER_SOL);
-    const maxSlippageLamports = new BN(Math.floor(amount * LAMPORTS_PER_SOL * (1 + slippage / 100)));
+    console.log(`🔧 Creating buy instruction for:`, {
+      buyer: buyer.toString(),
+      tokenMint: tokenMint.toString(),
+      bondingCurve: bondingCurve.toString(),
+      associatedBondingCurve: associatedBondingCurve.toString(),
+      creator: creator?.toString(),
+      amount,
+      slippage
+    });
+    
+    // Get bonding curve data to calculate token price (like Python bot)
+    const curveData = await this.solanaService.getBondingCurveData(bondingCurve.toString());
+    if (!curveData) {
+      throw new Error('Failed to get bonding curve data for price calculation');
+    }
+    
+    const tokenPriceSol = curveData.price;
+    const tokenAmount = amount / tokenPriceSol; // Calculate tokens to buy
+    
+    console.log(`🔢 Price calculation: ${tokenPriceSol} SOL per token, buying ${tokenAmount.toFixed(6)} tokens for ${amount} SOL`);
+    
+    // Convert to proper format for instruction
+    const maxAmountLamports = new BN(Math.floor(amount * LAMPORTS_PER_SOL * (1 + slippage / 100)));
+    const tokenAmountWithDecimals = new BN(Math.floor(tokenAmount * 1_000_000)); // 6 decimals like Python
+    
+    console.log(`📊 Instruction parameters:`, {
+      tokenAmount: tokenAmountWithDecimals.toString(),
+      maxSolAmount: maxAmountLamports.toString(),
+      creator: creator?.toString()
+    });
     
     // Check if we need to create the associated token account
     const buyerTokenAccount = await getAssociatedTokenAddress(tokenMint, buyer);
     
+    console.log(`🔍 Checking ATA: ${buyerTokenAccount.toString()}`);
+    
     try {
-      await this.connection.getAccountInfo(buyerTokenAccount);
+      const accountInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(buyerTokenAccount),
+        `getAccountInfo(ATA-${tokenMint.toString().substring(0, 8)}...)`
+      );
+      
+      if (!accountInfo) {
+        console.log(`📝 Creating ATA for buyer: ${buyerTokenAccount.toString()}`);
+        instructions.push(
+          createAssociatedTokenAccountInstruction(
+            buyer,
+            buyerTokenAccount,
+            buyer,
+            tokenMint
+          )
+        );
+      } else {
+        console.log(`✅ ATA already exists: ${buyerTokenAccount.toString()}`);
+      }
     } catch (error) {
-      // Account doesn't exist, create it
+      console.log(`📝 ATA check failed, assuming it needs creation: ${buyerTokenAccount.toString()}`);
       instructions.push(
         createAssociatedTokenAccountInstruction(
           buyer,
@@ -427,214 +553,253 @@ export class TradingService {
       );
     }
     
+    // Verify all required accounts exist before creating instruction
+    await this.verifyAccountsExist({
+      buyer,
+      tokenMint,
+      bondingCurve,
+      associatedBondingCurve,
+      creator
+    });
+    
     // Create the buy instruction
     const buyInstruction = await createPumpFunBuyInstruction(
       buyer,
       tokenMint,
-      lamports,
-      maxSlippageLamports
+      tokenAmountWithDecimals,
+      maxAmountLamports,
+      creator
     );
-    
+
     instructions.push(buyInstruction);
-    
     return instructions;
   }
-
-  private async createSellInstruction(
-    seller: PublicKey,
-    tokenMint: PublicKey,
-    bondingCurve: PublicKey,
-    associatedBondingCurve: PublicKey,
-    amount: number,
-    slippage: number
-  ): Promise<TransactionInstruction> {
-    // Get the actual token balance to sell
-    const sellerTokenAccount = await getAssociatedTokenAddress(tokenMint, seller);
-    const tokenAccountInfo = await this.connection.getTokenAccountBalance(sellerTokenAccount);
-    const tokenBalance = new BN(tokenAccountInfo.value.amount);
-    
-    // Calculate amount to sell (in token units, not SOL)
-    const sellAmount = tokenBalance.muln(amount).divn(100); // amount is percentage
-    const minSolOutput = new BN(Math.floor(amount * (1 - slippage / 100) * LAMPORTS_PER_SOL));
-    
-    // Create the sell instruction
-    return createPumpFunSellInstruction(
-      seller,
-      tokenMint,
-      sellAmount,
-      minSolOutput
-    );
-  }
-
+  
   /**
-   * Get real-time token data using IDL service
+   * Verify that all required accounts exist and are properly initialized
    */
-  async getTokenData(mint: string): Promise<{
-    price: number;
-    marketCap: number;
-    progress: number;
-    virtualSolReserves: number;
-    virtualTokenReserves: number;
-  } | null> {
-    if (!this.useIdlService) {
-      return null;
-    }
-
+  private async verifyAccountsExist(accounts: {
+    buyer: PublicKey;
+    tokenMint: PublicKey;
+    bondingCurve: PublicKey;
+    associatedBondingCurve: PublicKey;
+    creator?: PublicKey;
+  }): Promise<void> {
+    const { buyer, tokenMint, bondingCurve, associatedBondingCurve, creator } = accounts;
+    
+    console.log(`🔍 Verifying account existence...`);
+    
+    // Check bonding curve account
     try {
-      const mintPubkey = new PublicKey(mint);
-      const [bondingCurveState, globalState] = await Promise.all([
-        this.idlService.getBondingCurveState(mintPubkey),
-        this.idlService.getGlobalState()
-      ]);
-
-      if (!bondingCurveState || !globalState) {
-        return null;
-      }
-
-      const price = this.idlService.calculateTokenPrice(bondingCurveState);
-      const marketCap = this.idlService.calculateMarketCap(bondingCurveState);
-      const progress = this.idlService.calculateProgress(bondingCurveState, globalState);
-
-      return {
-        price,
-        marketCap,
-        progress,
-        virtualSolReserves: bondingCurveState.virtualSolReserves.toNumber(),
-        virtualTokenReserves: bondingCurveState.virtualTokenReserves.toNumber(),
-      };
-    } catch (error) {
-      console.error('Error fetching token data from IDL service:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Enhanced buy method that uses IDL service for better price calculation
-   */
-  async buyTokenWithIdl(
-    token: Token, 
-    wallet: WalletContextState,
-    amount: number,
-    slippage: number = 5
-  ): Promise<Trade> {
-    if (!wallet.publicKey || !wallet.signTransaction) {
-      throw new Error('Wallet not connected');
-    }
-
-    try {
-      // Get real-time token data for better price calculation
-      const tokenData = await this.getTokenData(token.address);
-      const currentPrice = tokenData?.price || token.price;
-
-      // Create buy instruction using IDL service if enabled
-      const amountBN = new BN(amount * LAMPORTS_PER_SOL);
-      const maxSlippageAmount = new BN(amount * LAMPORTS_PER_SOL * (1 + slippage / 100));
-
-      let buyInstruction: TransactionInstruction;
+      const bondingCurveInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(bondingCurve),
+        `verifyAccount(bondingCurve)`
+      );
       
-      if (this.useIdlService) {
-        buyInstruction = await this.idlService.createBuyInstruction(
-          wallet.publicKey,
-          new PublicKey(token.address),
-          amountBN,
-          maxSlippageAmount
-        );
-      } else {
-        buyInstruction = await createPumpFunBuyInstruction(
-          wallet.publicKey,
-          new PublicKey(token.address),
-          amountBN,
-          maxSlippageAmount
-        );
+      if (!bondingCurveInfo) {
+        throw new Error(`Bonding curve account does not exist: ${bondingCurve.toString()}`);
+      }
+      console.log(`✅ Bonding curve exists and has ${bondingCurveInfo.data.length} bytes of data`);
+    } catch (error) {
+      console.error(`❌ Bonding curve verification failed:`, error);
+      throw error;
+    }
+    
+    // Check associated bonding curve account
+    try {
+      const abcInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(associatedBondingCurve),
+        `verifyAccount(associatedBondingCurve)`
+      );
+      
+      if (!abcInfo) {
+        throw new Error(`Associated bonding curve account does not exist: ${associatedBondingCurve.toString()}`);
+      }
+      console.log(`✅ Associated bonding curve exists and has ${abcInfo.data.length} bytes of data`);
+    } catch (error) {
+      console.error(`❌ Associated bonding curve verification failed:`, error);
+      throw error;
+    }
+    
+    // Check mint account
+    try {
+      const mintInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getAccountInfo(tokenMint),
+        `verifyAccount(tokenMint)`
+      );
+      
+      if (!mintInfo) {
+        throw new Error(`Token mint account does not exist: ${tokenMint.toString()}`);
+      }
+      console.log(`✅ Token mint exists and has ${mintInfo.data.length} bytes of data`);
+    } catch (error) {
+      console.error(`❌ Token mint verification failed:`, error);
+      throw error;
+    }
+    
+    console.log(`✅ All required accounts verified successfully`);
+  }
+
+  // Placeholder methods for compatibility
+  async sellToken(): Promise<Trade | null> {
+    throw new Error('Sell functionality not implemented yet for browser wallet');
+  }
+
+  /**
+   * Execute sell transaction (autonomous version)
+   */
+  private async executeSell(
+    token: Token,
+    wallet: ExtendedWalletState,
+    slippage: number
+  ): Promise<Trade | null> {
+    try {
+      console.log(`🚀 PRODUCTION SELL: ${token.symbol}`);
+      
+      // Get current position if available
+      const position = this.positionManager?.getPosition(token.address);
+      if (!position) {
+        console.warn(`⚠️ No position found for ${token.symbol}, creating minimal sell order`);
       }
 
-      // Check if we need to create associated token account
-      const associatedTokenAddress = await getAssociatedTokenAddress(
-        new PublicKey(token.address),
-        wallet.publicKey
+      // Calculate accounts - Handle missing bondingCurve by calculating it
+      const mintPubkey = new PublicKey(token.address);
+      const accounts = calculatePumpFunAccounts(mintPubkey);
+      const bondingCurve = accounts.bondingCurve;
+      const associatedBondingCurve = accounts.associatedBondingCurve;
+
+      console.log(`🔧 Calculated bonding curve for ${token.symbol}: ${bondingCurve.toString()}`);
+
+      // Get current price and token balance
+      const curveData = await this.solanaService.getBondingCurveData(bondingCurve.toString());
+      if (!curveData) {
+        throw new Error(`Failed to get bonding curve data for sell: ${bondingCurve.toString()}`);
+      }
+
+      // Get token account balance
+      const buyerTokenAccount = await getAssociatedTokenAddress(mintPubkey, wallet.publicKey!);
+      const tokenAccountInfo = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getTokenAccountBalance(buyerTokenAccount),
+        'getTokenAccountBalance'
       );
 
-      const accountInfo = await this.connection.getAccountInfo(associatedTokenAddress);
-      const instructions: TransactionInstruction[] = [];
-
-      if (!accountInfo) {
-        const createATAInstruction = createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          associatedTokenAddress,
-          wallet.publicKey,
-          new PublicKey(token.address)
-        );
-        instructions.push(createATAInstruction);
+      const tokenBalance = parseFloat(tokenAccountInfo.value.amount) / Math.pow(10, tokenAccountInfo.value.decimals);
+      
+      if (tokenBalance <= 0) {
+        throw new Error(`No tokens to sell for ${token.symbol}`);
       }
 
-      instructions.push(buyInstruction);
+      console.log(`💰 Selling ${tokenBalance.toFixed(6)} ${token.symbol} tokens`);
 
-      // Add compute budget for better transaction success rate
-      const computeBudgetInstruction = ComputeBudgetProgram.setComputeUnitLimit({
-        units: 200_000,
-      });
-      instructions.unshift(computeBudgetInstruction);
+      // Get priority fee
+      const priorityFeeResult = await this.solanaService.getPriorityFeeManager().calculatePriorityFee();
+      const priorityFee = priorityFeeResult.fee;
 
-      const transaction = new Transaction().add(...instructions);
-      const { blockhash } = await this.connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      // Sign and send transaction
-      const signedTransaction = await wallet.signTransaction(transaction);
-      const signature = await this.connection.sendRawTransaction(signedTransaction.serialize());
+      // Create sell transaction
+      const transaction = new Transaction();
       
-      await this.connection.confirmTransaction(signature, 'confirmed');
+      transaction.add(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+      );
+
+      // Create sell instruction
+      const tokenAmountToSell = new BN(Math.floor(tokenBalance * 1_000_000)); // 6 decimals
+      const minSolAmount = new BN(Math.floor(curveData.price * tokenBalance * (1 - slippage / 100) * LAMPORTS_PER_SOL));
+
+      // Get creator if available - CRITICAL for sell instruction
+      let creatorPubkey: PublicKey | undefined;
+      if (token.creator) {
+        creatorPubkey = new PublicKey(token.creator);
+      } else if (curveData.state.creator) {
+        creatorPubkey = curveData.state.creator;
+      }
+
+      if (!creatorPubkey) {
+        throw new Error(`Creator not found for ${token.symbol}. Cannot create sell instruction.`);
+      }
+
+      console.log(`🔧 Using creator: ${creatorPubkey.toString()}`);
+
+      const sellInstruction = await createPumpFunSellInstruction(
+        wallet.publicKey!,
+        mintPubkey,
+        tokenAmountToSell,
+        minSolAmount,
+        creatorPubkey  // CRITICAL: Pass creator for vault calculation
+      );
+
+      transaction.add(sellInstruction);
+
+      // Get recent blockhash
+      const { blockhash } = await rpcRateLimiter.executeRPCCall(
+        () => this.connection.getLatestBlockhash(),
+        'getLatestBlockhash'
+      );
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey!;
+
+      // Execute transaction
+      let signature: string;
+      
+      if (wallet instanceof AutonomousWalletAdapter && this.autonomousWallet) {
+        console.log(`🤖 Using autonomous wallet for sell transaction`);
+        signature = await this.autonomousWallet.sendTransaction(transaction);
+        
+        const success = await this.autonomousWallet.confirmTransaction(signature);
+        if (!success) {
+          console.log(`❌ Sell transaction failed for ${token.symbol}: ${signature}`);
+          console.log(`🔗 Check transaction: https://solscan.io/tx/${signature}`);
+          console.log(`💡 This might be due to:`);
+          console.log(`   - Token migration to Raydium`);
+          console.log(`   - Insufficient liquidity`);
+          console.log(`   - Slippage tolerance too low`);
+          console.log(`   - Network congestion`);
+          throw new Error(`Sell transaction failed: ${signature}`);
+        }
+      } else {
+        console.log(`📱 Using browser wallet for sell (requires manual approval)`);
+        const signedTransaction = await wallet.signTransaction!(transaction);
+        signature = await rpcRateLimiter.executeRPCCall(
+          () => this.connection.sendRawTransaction(signedTransaction.serialize(), {
+            skipPreflight: true,
+            preflightCommitment: 'confirmed'
+          }),
+          'sendRawTransaction'
+        );
+
+        const success = await this.solanaService.confirmTransactionRobust(signature);
+        if (!success) {
+          throw new Error(`Sell transaction failed: ${signature}`);
+        }
+      }
 
       const trade: Trade = {
         id: signature,
         tokenAddress: token.address,
         tokenSymbol: token.symbol,
-        type: 'buy',
-        amount: amount,
-        price: currentPrice,
+        type: 'sell',
+        amount: tokenBalance,
+        price: curveData.price,
         timestamp: Date.now(),
         signature: signature,
         status: 'success'
       };
 
+      console.log(`✅ Successfully sold ${token.symbol}: ${signature}`);
       return trade;
-    } catch (error) {
-      console.error('Buy transaction failed:', error);
-      
-      const trade: Trade = {
-        id: Date.now().toString(),
-        tokenAddress: token.address,
-        tokenSymbol: token.symbol,
-        type: 'buy',
-        amount: amount,
-        price: token.price,
-        timestamp: Date.now(),
-        signature: '',
-        status: 'failed'
-      };
 
-      return trade;
+    } catch (error) {
+      console.error(`Error selling ${token.symbol}:`, error);
+      throw error;
     }
   }
 
-  // Calculate potential profit/loss
-  calculatePnL(entryPrice: number, currentPrice: number, amount: number): { pnl: number; pnlPercent: number } {
-    const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
-    const pnl = (currentPrice - entryPrice) * amount;
-    
-    return { pnl, pnlPercent };
+  async shouldBuyToken(): Promise<boolean> {
+    return false;
   }
 
-  // Get current token balance
-  async getTokenBalance(wallet: PublicKey, tokenMint: PublicKey): Promise<number> {
-    try {
-      const associatedTokenAccount = await getAssociatedTokenAddress(tokenMint, wallet);
-      const tokenAccountInfo = await this.connection.getTokenAccountBalance(associatedTokenAccount);
-      return tokenAccountInfo.value.uiAmount || 0;
-    } catch (error) {
-      console.error('Error getting token balance:', error);
-      return 0;
-    }
+  async shouldSellToken(): Promise<boolean> {
+    return false;
   }
 }

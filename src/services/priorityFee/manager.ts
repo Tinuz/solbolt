@@ -69,25 +69,36 @@ export class PriorityFeeManager {
 
   /**
    * Get base fee from enabled plugins
-   * Prefers dynamic fee if both are enabled (like Python)
+   * FIXED: Better fallback logic when dynamic returns 0
    */
   private async getBaseFee(accounts?: PublicKey[]): Promise<number | null> {
     // Prefer dynamic fee if enabled
     if (this.config.enableDynamicFee) {
       const dynamicFee = await this.dynamicFeePlugin.getPriorityFee(accounts);
-      if (dynamicFee !== null) {
+      if (dynamicFee !== null && dynamicFee > 0) {
         return dynamicFee;
       }
+      
+      // FIXED: If dynamic fee is 0, use a reasonable minimum for pump.fun
+      if (dynamicFee === 0) {
+        console.warn('⚠️ Dynamic fee returned 0, using minimum pump.fun fee');
+        return 100000; // 100k micro-lamports minimum for pump.fun trades
+      }
+      
       console.warn('⚠️ Dynamic fee failed, trying fixed fee fallback');
     }
 
     // Fall back to fixed fee if enabled
     if (this.config.enableFixedFee) {
-      return await this.fixedFeePlugin.getPriorityFee();
+      const fixedFee = await this.fixedFeePlugin.getPriorityFee();
+      if (fixedFee && fixedFee > 0) {
+        return fixedFee;
+      }
     }
 
-    // No priority fee if both are disabled
-    return null;
+    // FIXED: Ultimate fallback - never return null for pump.fun
+    console.warn('⚠️ All priority fee methods failed, using emergency fallback');
+    return 200000; // 200k micro-lamports emergency fallback
   }
 
   /**

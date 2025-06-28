@@ -63,15 +63,31 @@ export function useBot(): UseBotState {
     startTime: Date.now()
   });
   
-  const [config, setConfig] = useState<BotConfig>({
-    enabled: true,
-    maxTokenAge: 30, // Increased from 5 to 30 minutes
-    buyAmount: 0.01,
-    sellPercentage: 100,
-    stopLoss: 20,
-    takeProfit: 100,
-    maxPositions: 5,
-    slippage: 5
+  const [config, setConfig] = useState<BotConfig>(() => {
+    const botConfig = {
+      enabled: true,
+      maxTokenAge: 30, // 30 minutes
+      buyAmount: parseFloat(process.env.NEXT_PUBLIC_DEFAULT_BUY_AMOUNT || '0.001'), // Use env var
+      sellPercentage: 100,
+      stopLoss: parseFloat(process.env.NEXT_PUBLIC_STOP_LOSS_PERCENTAGE || '20'),
+      takeProfit: parseFloat(process.env.NEXT_PUBLIC_TAKE_PROFIT_PERCENTAGE || '100'),
+      maxPositions: parseInt(process.env.NEXT_PUBLIC_MAX_CONCURRENT_POSITIONS || '1'), // ⭐ KEY FIX: Use env var
+      slippage: parseFloat(process.env.NEXT_PUBLIC_MAX_SLIPPAGE || '5')
+    };
+    
+    console.log('🔧 Bot Config loaded from environment:', {
+      maxPositions: botConfig.maxPositions,
+      buyAmount: botConfig.buyAmount,
+      stopLoss: botConfig.stopLoss,
+      takeProfit: botConfig.takeProfit,
+      fromEnv: {
+        MAX_CONCURRENT_POSITIONS: process.env.NEXT_PUBLIC_MAX_CONCURRENT_POSITIONS,
+        DEFAULT_BUY_AMOUNT: process.env.NEXT_PUBLIC_DEFAULT_BUY_AMOUNT,
+        MAX_SLIPPAGE: process.env.NEXT_PUBLIC_MAX_SLIPPAGE
+      }
+    });
+    
+    return botConfig;
   });
 
   // Bot event listener
