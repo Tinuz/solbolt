@@ -1,11 +1,12 @@
 /**
  * Production-Grade Autonomous Trading Manager
  * Uses new Position management, Priority Fee Manager, and Bonding Curve Manager
+ * Refactored to work entirely through PositionManager without local position tracking
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { WalletContextState } from '@solana/wallet-adapter-react';
-import { Token, Trade } from '@/types';
+import { Token, Trade, Position as UIPosition } from '@/types';
 import { TradingService } from './trading';
 import { SolanaService } from './solana';
 import { Position, PositionConfig, ExitReason } from './position';
@@ -39,7 +40,6 @@ export class AutonomousTradingManager {
   private solanaService: SolanaService;
   private bondingCurveManager: BondingCurveManager;
   private isRunning: boolean = false;
-  private positions: Position[] = [];
   private priceCheckInterval: NodeJS.Timeout | null = null;
   private trades: Trade[] = [];
 
@@ -69,6 +69,16 @@ export class AutonomousTradingManager {
   start(): void {
     if (this.isRunning) return;
     
+    // Verify autonomous wallet is properly configured
+    const autonomousWallet = this.tradingService.getAutonomousWallet();
+    if (!autonomousWallet) {
+      console.error('❌ Autonomous wallet not configured! Set NEXT_PUBLIC_AUTONOMOUS_PRIVATE_KEY in environment variables.');
+      console.log('💡 Without autonomous wallet, manual signing will be required for each trade.');
+      throw new Error('Autonomous wallet required for autonomous trading');
+    }
+    
+    console.log('✅ Autonomous wallet configured:', autonomousWallet.publicKey.toString());
+    
     this.isRunning = true;
     console.log('🚀 Starting production autonomous trading with advanced position management...');
     
@@ -90,33 +100,56 @@ export class AutonomousTradingManager {
       this.priceCheckInterval = null;
     }
 
-    // Shutdown trading service and close all positions
-    console.log('🔌 Shutting down trading service and closing all positions...');
-    await this.tradingService.shutdown();
-    
-    console.log('✅ Autonomous trading stopped and all positions closed');
+    // Close all active positions when stopping
+    const positionManager = this.tradingService.getPositionManager();
+    if (positionManager) {
+      await positionManager.emergencyCloseAllPositions();
+    }
   }
 
-  async evaluateToken(token: Token, wallet: WalletContextState): Promise<TradingSignal | null> {
+  async shouldBuyToken(token: Token): Promise<TradingSignal | null> {
     try {
-      console.log(`🔍 Evaluating token for autonomous trading: ${token.symbol}`);
-      console.log(`📊 Token details:`, {
-        symbol: token.symbol,
-        address: token.address,
-        createdOn: new Date(token.createdOn).toISOString(),
-        ageMs: Date.now() - token.createdOn,
-        ageSec: (Date.now() - token.createdOn) / 1000,
-        price: token.price,
-        liquidity: token.liquidity,
-        bondingCurve: token.bondingCurve || 'none'
-      });
+      console.log(`🔍 Evaluating token: ${token.symbol} for autonomous trading...`);
+
+      // Token data validatie
+      if (!token.address || !token.symbol || !token.name) {
+        console.log(`❌ REJECTION REASON: Missing token data for ${token.symbol}`);
+        return null;
+      }
+
+      // Validate bonding curve exists
+      if (!token.bondingCurve || token.bondingCurve === 'none') {
+        console.log(`❌ REJECTION REASON: No bonding curve for ${token.symbol}`);
+        return null;
+      }
+
+      console.log(`📋 Token validation passed for ${token.symbol}`);
+      console.log(`💰 Market cap: $${token.marketCap?.toLocaleString() || 'unknown'}`);
+      console.log(`🏊 Liquidity: ${token.liquidity?.toFixed(4) || 'unknown'} SOL`);
+      console.log(`💱 Current price: ${token.price?.toFixed(8) || 'unknown'} SOL`);
+      console.log(`🎯 Bonding curve: ${token.bondingCurve}`);
+
+      // Check liquidity
+      if (token.liquidity !== undefined && token.liquidity < this.config.minLiquidity) {
+        console.log(`⚠️ Low liquidity: ${token.liquidity.toFixed(4)} SOL < ${this.config.minLiquidity} SOL minimum`);
+        console.log(`❌ REJECTION REASON: Insufficient liquidity for ${token.symbol}`);
+        return null;
+      }
 
       // Check if we've reached max positions
-      const activePositions = this.getActivePositions().length;
+      const activePositions = this.getActivePositionsCount();
       console.log(`📈 Position check: ${activePositions}/${this.config.maxPositions} positions`);
       if (activePositions >= this.config.maxPositions) {
         console.log(`⚠️ Max positions reached (${activePositions}/${this.config.maxPositions})`);
         console.log(`❌ REJECTION REASON: Max positions reached for ${token.symbol}`);
+        return null;
+      }
+
+      // Check if we already have a position in this token
+      const existingPosition = this.hasPositionForToken(token.address);
+      if (existingPosition) {
+        console.log(`⚠️ Already have position in ${token.symbol}`);
+        console.log(`❌ REJECTION REASON: Already have position in ${token.symbol}`);
         return null;
       }
 
@@ -128,78 +161,20 @@ export class AutonomousTradingManager {
       
       if (tokenAge < minTokenAge) {
         console.log(`⚠️ Token too new: ${tokenAge.toFixed(3)}s < ${minTokenAge}s (waiting for minimum age)`);
-        console.log(`❌ REJECTION REASON: Token too new for ${token.symbol} (${tokenAge.toFixed(3)}s < ${minTokenAge}s)`);
+        console.log(`❌ REJECTION REASON: Token too new for ${token.symbol}`);
         return null;
       }
 
       if (tokenAge > this.config.maxTokenAge) {
-        console.log(`⚠️ Token too old: ${tokenAge.toFixed(3)}s > ${this.config.maxTokenAge}s (max allowed age)`);
-        console.log(`❌ REJECTION REASON: Token too old for ${token.symbol} (${tokenAge.toFixed(3)}s > ${this.config.maxTokenAge}s)`);
+        console.log(`⚠️ Token too old: ${tokenAge.toFixed(3)}s > ${this.config.maxTokenAge}s (avoiding stale tokens)`);
+        console.log(`❌ REJECTION REASON: Token too old for ${token.symbol}`);
         return null;
       }
 
-      // Check liquidity using bonding curve data
-      let liquidityCheck = true;
-      console.log(`💧 Liquidity check starting...`);
-      
-      if (token.bondingCurve) {
-        try {
-          console.log(`🔍 Checking bonding curve: ${token.bondingCurve}`);
-          const curveData = await this.solanaService.getBondingCurveData(token.bondingCurve);
-          if (curveData) {
-            console.log(`💰 Curve data:`, {
-              solReserves: curveData.solReserves.toFixed(6),
-              price: curveData.price.toFixed(8),
-              minRequired: this.config.minLiquidity
-            });
-            if (curveData.solReserves < this.config.minLiquidity) {
-              console.log(`⚠️ Insufficient liquidity: ${curveData.solReserves.toFixed(6)} < ${this.config.minLiquidity} SOL`);
-              liquidityCheck = false;
-            } else {
-              console.log(`✅ Liquidity sufficient: ${curveData.solReserves.toFixed(6)} >= ${this.config.minLiquidity} SOL`);
-            }
-          } else {
-            console.log(`🔄 No bonding curve data available - token likely migrated to Raydium`);
-            console.log(`❌ REJECTION REASON: Cannot trade ${token.symbol} - bonding curve has no data (migrated to Raydium)`);
-            return null;
-          }
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          
-          if (errorMessage.includes('Invalid bonding curve discriminator')) {
-            console.warn(`⚠️ Token ${token.symbol} has invalid bonding curve format - possibly not a pump.fun token`);
-            console.log(`❌ REJECTION REASON: Invalid bonding curve format for ${token.symbol}`);
-            return null;
-          } else if (errorMessage.includes('No data in bonding curve account') || errorMessage.includes('Empty bonding curve account')) {
-            console.warn(`⚠️ Token ${token.symbol} bonding curve account is empty - possibly migrated to Raydium`);
-            console.log(`❌ REJECTION REASON: Bonding curve empty for ${token.symbol} (migrated to Raydium)`);
-            return null;
-          } else {
-            console.warn(`⚠️ Could not check bonding curve liquidity for ${token.symbol}:`, errorMessage);
-            console.log(`❌ REJECTION REASON: Bonding curve error for ${token.symbol}: ${errorMessage}`);
-            return null;
-          }
-        }
-      } else {
-        console.log(`❌ No bonding curve provided - cannot trade token without pump.fun bonding curve`);
-        console.log(`❌ REJECTION REASON: No bonding curve for ${token.symbol}`);
-        return null;
-      }
-
-      if (!liquidityCheck) {
-        console.log(`❌ Token failed liquidity check`);
+      // Check liquidity
+      if (token.liquidity !== undefined && token.liquidity < this.config.minLiquidity) {
+        console.log(`⚠️ Low liquidity: ${token.liquidity.toFixed(4)} SOL < ${this.config.minLiquidity} SOL minimum`);
         console.log(`❌ REJECTION REASON: Insufficient liquidity for ${token.symbol}`);
-        return null;
-      }
-
-      // Check if we already have a position in this token
-      const existingPosition = this.positions.find(
-        pos => pos.isActive && pos.mint.toString() === token.address
-      );
-
-      if (existingPosition) {
-        console.log(`⚠️ Already have position in ${token.symbol}`);
-        console.log(`❌ REJECTION REASON: Already have position in ${token.symbol}`);
         return null;
       }
 
@@ -219,58 +194,23 @@ export class AutonomousTradingManager {
     }
   }
 
-  async executeBuy(token: Token, wallet: WalletContextState): Promise<boolean> {
+  async executeBuy(token: Token): Promise<boolean> {
     try {
-      console.log(`🚀 PRODUCTION BUY: ${token.symbol} for ${this.config.buyAmount} SOL`);
+      console.log(`🎯 Executing autonomous buy for ${token.symbol}...`);
 
-      // Try autonomous trading first if available, fallback to browser wallet
-      let trade: Trade | null = null;
-      
-      try {
-        // First attempt: Use autonomous wallet for seamless trading
-        trade = await this.tradingService.buyTokenAutonomous(
-          token,
-          this.config.buyAmount,
-          this.config.maxSlippage
-        );
-        console.log(`🤖 Autonomous trade executed for ${token.symbol}`);
-      } catch (autonomousError) {
-        console.log(`⚠️ Autonomous trading not available, falling back to browser wallet:`, autonomousError);
-        
-        // Fallback: Use browser wallet (requires manual approval)
-        trade = await this.tradingService.buyToken(
-          token,
-          wallet,
-          this.config.buyAmount,
-          this.config.maxSlippage
-        );
-        console.log(`📱 Browser wallet trade executed for ${token.symbol}`);
-      }
+      const result = await this.tradingService.buyTokenAutonomous(
+        token,
+        this.config.buyAmount,
+        this.config.maxSlippage
+      );
 
-      if (trade && trade.status === 'success') {
-        // Create position with production-grade configuration
-        const positionConfig: PositionConfig = {
-          takeProfitPercentage: this.config.takeProfitPercentage,
-          stopLossPercentage: this.config.stopLossPercentage,
-          trailingStopLoss: this.config.trailingStopLoss,
-          maxHoldTime: this.config.maxHoldTime
-        };
+      if (result && result.status === 'success' && result.signature) {
+        console.log(`✅ Buy successful for ${token.symbol}! Signature: ${result.signature}`);
 
-        const position = Position.createFromBuyResult(
-          new PublicKey(token.address),
-          token.symbol,
-          token.name,
-          trade.price,
-          trade.amount,
-          this.config.buyAmount,
-          positionConfig,
-          trade.signature
-        );
+        // Trade record is already created by TradingService, just add to local tracking
+        this.trades.push(result);
 
-        this.positions.push(position);
-        this.trades.push(trade);
-
-        console.log(`✅ Position created: ${position.toString()}`);
+        console.log(`✅ Buy executed and position created for ${token.symbol}`);
         return true;
       }
 
@@ -282,9 +222,14 @@ export class AutonomousTradingManager {
   }
 
   private async checkPositions(): Promise<void> {
-    if (!this.isRunning || this.positions.length === 0) return;
+    if (!this.isRunning) return;
 
-    const activePositions = this.getActivePositions();
+    const positionManager = this.tradingService.getPositionManager();
+    if (!positionManager) return;
+
+    const activePositions = positionManager.getActivePositions();
+    if (activePositions.length === 0) return;
+
     console.log(`🔍 Checking ${activePositions.length} active positions...`);
 
     for (const position of activePositions) {
@@ -299,15 +244,40 @@ export class AutonomousTradingManager {
           continue;
         }
 
-        // Check if position should exit using new Position logic
+        // Check if position should exit using Position logic
         const exitCondition = position.shouldExit(currentPrice);
         
         if (exitCondition.shouldExit && exitCondition.reason) {
           console.log(`🚨 SELL SIGNAL for ${position.symbol}: ${exitCondition.reason} (urgency: ${exitCondition.urgency})`);
 
-          // Create token object for trading service
-          const token = this.createTokenFromPosition(position, currentPrice);
-          await this.executeSell(position, token, exitCondition.reason, currentPrice);
+          // Create token object for sell
+          const tokenForSell: Token = {
+            address: position.mint.toString(),
+            name: position.name,
+            symbol: position.symbol,
+            description: '',
+            image: '',
+            showName: true,
+            createdOn: position.entryTime.getTime(),
+            website: '',
+            telegram: '',
+            twitter: '',
+            bondingCurve: '',
+            associatedBondingCurve: '',
+            creator: '',
+            marketCap: 0,
+            price: currentPrice,
+            progress: 0,
+            virtualSolReserves: 0,
+            virtualTokenReserves: 0,
+            liquidity: 0,
+            volume24h: 0,
+            priceChange24h: 0,
+            holders: 0
+          };
+
+          // Execute sell through TradingService which will handle position closing
+          await this.tradingService.sellTokenAutonomous(tokenForSell, this.config.maxSlippage);
         } else {
           // Log current PnL for active positions
           const pnl = position.calculatePnL(currentPrice);
@@ -322,65 +292,73 @@ export class AutonomousTradingManager {
     }
   }
 
-  private async executeSell(
-    position: Position, 
-    token: Token, 
-    reason: ExitReason, 
-    currentPrice: number
-  ): Promise<void> {
-    try {
-      // Note: This requires wallet context - in production, this would need to be passed
-      // For now, we'll close the position with the expected price
-      console.log(`🔥 Executing sell for ${position.symbol} due to ${reason}`);
-      
-      // In a real implementation, you would execute the sell transaction here
-      // const trade = await this.tradingService.sellToken(token, wallet, 100, this.config.maxSlippage);
-      
-      // For now, simulate successful sell
-      position.closePosition(currentPrice, reason, 'simulated_tx_signature');
-      
-      const pnl = position.calculatePnL();
-      console.log(`📊 Position closed: ${pnl.roi >= 0 ? '+' : ''}${pnl.roi.toFixed(2)}% ROI (${pnl.unrealizedPnlSol.toFixed(6)} SOL)`);
-
-    } catch (error) {
-      console.error(`❌ Error executing sell for ${position.symbol}:`, error);
-    }
+  // Helper methods to work with PositionManager
+  private getActivePositionsCount(): number {
+    const positionManager = this.tradingService.getPositionManager();
+    if (!positionManager) return 0;
+    return positionManager.getActivePositions().length;
   }
 
-  private createTokenFromPosition(position: Position, currentPrice: number): Token {
-    return {
-      address: position.mint.toString(),
-      symbol: position.symbol,
-      name: position.name,
-      description: '',
-      image: '',
-      showName: true,
-      createdOn: Date.now(),
-      website: '',
-      telegram: '',
-      twitter: '',
-      bondingCurve: '',
-      associatedBondingCurve: '',
-      creator: '',
-      marketCap: 0,
-      price: currentPrice,
-      progress: 0,
-      virtualSolReserves: 0,
-      virtualTokenReserves: 0,
-      liquidity: 0,
-      volume24h: 0,
-      priceChange24h: 0,
-      holders: 0,
-    };
+  private hasPositionForToken(tokenAddress: string): boolean {
+    const positionManager = this.tradingService.getPositionManager();
+    if (!positionManager) return false;
+    
+    const activePositions = positionManager.getActivePositions();
+    return activePositions.some(pos => pos.mint.toString() === tokenAddress);
   }
 
-  // Public getters
-  getActivePositions(): Position[] {
-    return this.positions.filter(position => position.isActive);
+  // Public getters that map to UI types
+  getActivePositions(): UIPosition[] {
+    const positionManager = this.tradingService.getPositionManager();
+    if (!positionManager) return [];
+
+    return positionManager.getActivePositions().map(pos => {
+      const pnl = pos.calculatePnL();
+      return {
+        id: pos.mint.toString(),
+        tokenAddress: pos.mint.toString(),
+        tokenSymbol: pos.symbol,
+        tokenName: pos.name,
+        amount: pos.quantity,
+        entryPrice: pos.entryPrice,
+        currentPrice: pnl.currentPrice,
+        solInvested: pos.solInvested,
+        currentValue: pnl.currentValue,
+        pnl: pnl.unrealizedPnlSol,
+        pnlPercent: pnl.priceChangePercent,
+        pnlPercentage: pnl.priceChangePercent,
+        openedAt: pos.entryTime.getTime(),
+        status: pos.isActive ? 'open' as const : 'closed' as const
+      };
+    });
   }
 
-  getAllPositions(): Position[] {
-    return [...this.positions];
+  getAllPositions(): UIPosition[] {
+    const positionManager = this.tradingService.getPositionManager();
+    if (!positionManager) return [];
+
+    return positionManager.getAllPositions().map(pos => {
+      const pnl = pos.calculatePnL();
+      return {
+        id: pos.mint.toString(),
+        tokenAddress: pos.mint.toString(),
+        tokenSymbol: pos.symbol,
+        tokenName: pos.name,
+        amount: pos.quantity,
+        entryPrice: pos.entryPrice,
+        currentPrice: pnl.currentPrice,
+        solInvested: pos.solInvested,
+        currentValue: pnl.currentValue,
+        pnl: pnl.unrealizedPnlSol,
+        pnlPercent: pnl.priceChangePercent,
+        pnlPercentage: pnl.priceChangePercent,
+        openedAt: pos.entryTime.getTime(),
+        closedAt: pos.exitTime?.getTime(),
+        status: pos.isActive ? 'open' as const : 'closed' as const,
+        exitReason: pos.exitReason?.toString(),
+        exitTimestamp: pos.exitTime?.getTime()
+      };
+    });
   }
 
   getTrades(): Trade[] {
@@ -389,18 +367,18 @@ export class AutonomousTradingManager {
 
   getStats() {
     const active = this.getActivePositions();
-    const closed = this.positions.filter(p => !p.isActive);
+    const all = this.getAllPositions();
+    const closed = all.filter(p => p.status === 'closed');
     
     let totalPnL = 0;
     closed.forEach(position => {
-      const pnl = position.calculatePnL();
-      totalPnL += pnl.unrealizedPnlSol;
+      totalPnL += position.pnl;
     });
 
     return {
       isRunning: this.isRunning,
       activePositions: active.length,
-      totalPositions: this.positions.length,
+      totalPositions: all.length,
       totalTrades: this.trades.length,
       totalPnL: totalPnL,
       config: this.config

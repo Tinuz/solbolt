@@ -63,6 +63,9 @@ export interface Position {
   openedAt: number;
   closedAt?: number;
   status: 'open' | 'closed';
+  exitPrice?: number;
+  exitReason?: string;
+  exitTimestamp?: number;
 }
 
 export interface WalletState {

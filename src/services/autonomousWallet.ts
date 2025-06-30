@@ -101,7 +101,8 @@ export class AutonomousWallet implements AutonomousWalletInterface {
       console.log(`🔍 Confirming transaction: ${signature}`);
       
       // Use polling instead of WebSocket (more reliable for Chainstack)
-      const maxAttempts = 30; // 30 attempts
+      // Increased timeout for sell transactions (90 seconds total)
+      const maxAttempts = 45; // 45 attempts 
       const pollInterval = 2000; // 2 seconds between checks
       
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -125,9 +126,15 @@ export class AutonomousWallet implements AutonomousWalletInterface {
               return success;
             }
             
-            console.log(`⏳ Transaction status (attempt ${attempt}/${maxAttempts}): ${status.confirmationStatus || 'pending'}`);
+            // Log progress every 10 attempts to reduce spam
+            if (attempt % 10 === 0 || attempt <= 5) {
+              console.log(`⏳ Transaction status (attempt ${attempt}/${maxAttempts}): ${status.confirmationStatus || 'pending'}`);
+            }
           } else {
-            console.log(`⏳ Transaction not found yet (attempt ${attempt}/${maxAttempts})`);
+            // Log progress every 10 attempts to reduce spam  
+            if (attempt % 10 === 0 || attempt <= 5) {
+              console.log(`⏳ Transaction not found yet (attempt ${attempt}/${maxAttempts})`);
+            }
           }
           
           // Wait before next attempt (except on last attempt)
@@ -145,7 +152,28 @@ export class AutonomousWallet implements AutonomousWalletInterface {
         }
       }
       
-      console.warn(`⚠️ Transaction confirmation timeout after ${maxAttempts} attempts: ${signature}`);
+      // Before giving up, do one final check with RPC transaction lookup
+      console.log(`🔍 Final verification attempt for transaction: ${signature}`);
+      try {
+        const txInfo = await rpcRateLimiter.executeRPCCall(
+          () => this.connection.getTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
+          }),
+          'getTransaction(final_check)'
+        );
+        
+        if (txInfo) {
+          const success = !txInfo.meta?.err;
+          console.log(`${success ? '✅' : '❌'} Final check: Transaction ${success ? 'found and successful' : 'found but failed'}: ${signature}`);
+          return success;
+        }
+      } catch (finalError) {
+        console.warn(`⚠️ Final transaction lookup failed:`, finalError);
+      }
+      
+      console.warn(`⚠️ Transaction confirmation timeout after ${maxAttempts} attempts (${maxAttempts * pollInterval / 1000}s): ${signature}`);
+      console.log(`🔗 Manual check: https://solscan.io/tx/${signature}`);
       return false;
 
     } catch (error) {

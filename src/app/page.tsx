@@ -26,6 +26,26 @@ export default function Home() {
   const [isMounted, setIsMounted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   
+  // Handle hydration first
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
+  
+  // Only render the main component after hydration
+  if (!isMounted) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center">
+        <div className="text-white text-xl">Loading SolBot v3...</div>
+      </div>
+    );
+  }
+
+  return <HomeContent />;
+}
+
+function HomeContent() {
+  const [showSettings, setShowSettings] = useState(false);
+  
   // Use the bot hook instead of managing bot state manually
   const {
     isRunning,
@@ -48,11 +68,6 @@ export default function Home() {
   const { publicKey, connected } = useWallet();
   const { connection } = useConnection();
   const [walletBalance, setWalletBalance] = useState(0);
-
-  // Handle hydration
-  useEffect(() => {
-    setIsMounted(true);
-  }, []);
 
   // Update wallet balance
   useEffect(() => {
@@ -122,19 +137,13 @@ export default function Home() {
             </div>
             
             <div className="flex items-center space-x-4">
-              {isMounted && connected && (
+              {connected && (
                 <div className="flex items-center space-x-2 text-sm">
                   <Wallet className="w-4 h-4" />
                   <span>{walletBalance.toFixed(3)} SOL</span>
                 </div>
               )}
-              {isMounted ? (
-                <WalletMultiButton className="!bg-purple-600 hover:!bg-purple-700" />
-              ) : (
-                <div className="bg-purple-600 px-4 py-2 rounded-lg animate-pulse">
-                  <span className="text-white text-sm">Loading...</span>
-                </div>
-              )}
+              <WalletMultiButton className="!bg-purple-600 hover:!bg-purple-700" />
             </div>
           </div>
         </div>
@@ -338,8 +347,8 @@ export default function Home() {
                     <p>No open positions</p>
                   </div>
                 ) : (
-                  positions.map((position) => (
-                    <div key={position.tokenAddress} className="bg-gray-700 rounded-lg p-4 border border-gray-600/30">
+                  positions.map((position, index) => (
+                    <div key={`${position.tokenAddress}_${index}`} className="bg-gray-700 rounded-lg p-4 border border-gray-600/30">
                       <div className="flex items-start justify-between mb-4">
                         <div className="flex-1 min-w-0">
                           <h3 className="font-semibold text-white text-lg mb-1">{position.tokenSymbol}</h3>
@@ -387,8 +396,8 @@ export default function Home() {
                     <p>No trades executed yet</p>
                   </div>
                 ) : (
-                  trades.slice(0, 20).map((trade) => (
-                    <div key={trade.id} className="flex items-center justify-between py-2 border-b border-gray-700 last:border-b-0">
+                  trades.slice(0, 20).map((trade, index) => (
+                    <div key={`${trade.id}_${index}`} className="flex items-center justify-between py-2 border-b border-gray-700 last:border-b-0">
                       <div className="flex items-center space-x-3">
                         <div className={`w-3 h-3 rounded-full ${
                           trade.type === 'buy' ? 'bg-green-400' : 'bg-red-400'

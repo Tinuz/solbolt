@@ -67,8 +67,14 @@ export class PumpFunTradingBot {
     this.solanaService = new SolanaService(endpoint);
     
     // Set up price update callback
-    this.tradingService.setOnPriceUpdateCallback((priceUpdate) => {
-      this.notifyListeners('onPriceUpdate', priceUpdate);
+    this.tradingService.setOnPriceUpdateCallback((data) => {
+      if (data.type === 'positionClosed') {
+        // Handle position closure
+        this.handlePositionClosure(data);
+      } else {
+        // Handle regular price update
+        this.notifyListeners('onPriceUpdate', data);
+      }
     });
     
     // Initialize stats
@@ -267,10 +273,10 @@ export class PumpFunTradingBot {
       if (this.autonomousTrading && this.autonomousTrading.isRunningTrading()) {
         console.log(`🤖 Evaluating token for autonomous trading: ${token.symbol}`);
         try {
-          const signal = await this.autonomousTrading.evaluateToken(token, this.wallet);
+          const signal = await this.autonomousTrading.shouldBuyToken(token);
           if (signal && signal.action === 'buy') {
             console.log(`🎯 Autonomous trading signal: ${signal.action} ${token.symbol} - ${signal.reason}`);
-            const success = await this.autonomousTrading.executeBuy(token, this.wallet);
+            const success = await this.autonomousTrading.executeBuy(token);
             if (success) {
               console.log(`✅ Autonomous buy executed for ${token.symbol}`);
               // Get the latest trade from the manager
@@ -284,7 +290,7 @@ export class PumpFunTradingBot {
             }
           } else {
             if (signal === null) {
-              console.log(`❌ No trading signal generated for ${token.symbol} (evaluateToken returned null)`);
+              console.log(`❌ No trading signal generated for ${token.symbol} (shouldBuyToken returned null)`);
               console.log(`🔍 Check autonomous trading logs above for specific rejection reason`);
             } else {
               console.log(`❌ Unexpected signal result for ${token.symbol}:`, signal);
@@ -338,6 +344,63 @@ export class PumpFunTradingBot {
       this.positions.set(trade.tokenAddress, position);
       this.notifyListeners('onPositionOpened', position);
     }
+  }
+
+  /**
+   * Handle position closure events
+   */
+  private handlePositionClosure(data: any): void {
+    const { tokenAddress, tokenSymbol, exitPrice, exitReason, sellTrade } = data;
+    
+    console.log(`🔄 Handling position closure for ${tokenSymbol}...`);
+    
+    // Update position status in our tracking
+    const position = this.positions.get(tokenAddress);
+    if (position) {
+      position.status = 'closed';
+      position.exitPrice = exitPrice;
+      position.exitReason = exitReason;
+      position.exitTimestamp = Date.now();
+      
+      // Calculate final PnL
+      const pnl = position.currentValue - position.solInvested;
+      const pnlPercent = position.solInvested > 0 ? (pnl / position.solInvested) * 100 : 0;
+      
+      position.pnl = pnl;
+      position.pnlPercent = pnlPercent;
+      position.pnlPercentage = pnlPercent;
+      
+      console.log(`💰 Position ${tokenSymbol} closed with ${pnlPercent > 0 ? 'profit' : 'loss'}: ${pnlPercent.toFixed(2)}%`);
+    }
+    
+    // Add sell trade to history with correct values, but prevent duplicates
+    if (sellTrade) {
+      const alreadyExists = this.trades.some(t => t.signature && sellTrade.signature && t.signature === sellTrade.signature);
+      if (!alreadyExists) {
+        this.trades.unshift(sellTrade);
+      }
+      // Update stats
+      this.stats.tradesExecuted++;
+      if (sellTrade.status === 'success') {
+        this.stats.successfulTrades++;
+        // Calculate PnL for stats if we have position info
+        if (position) {
+          this.stats.totalPnl += position.pnl || 0;
+          this.stats.totalPnlPercent = this.stats.successfulTrades > 0 
+            ? (this.stats.totalPnl / this.stats.successfulTrades) * 100 
+            : 0;
+        }
+      } else {
+        this.stats.failedTrades++;
+      }
+    }
+    
+    // Notify UI about position closure
+    this.notifyListeners('onPositionClosed', position, sellTrade);
+    this.notifyListeners('onTradeExecuted', sellTrade);
+    this.notifyListeners('onStatsUpdate', this.stats);
+    
+    console.log(`✅ Position closure handled for ${tokenSymbol}`);
   }
 
   private startStatsUpdate(): void {

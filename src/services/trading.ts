@@ -133,6 +133,31 @@ export class TradingService {
           sellResult.signature
         );
         
+        // Create sell trade record for history (use signature as unique ID)
+        const sellTrade: any = {
+          id: sellResult.signature, // Use transaction signature for unique ID
+          type: 'sell',
+          tokenAddress: token.address,
+          tokenSymbol: token.symbol,
+          amount: sellResult.amount, // Token amount sold
+          price: sellResult.price,   // SOL price per token
+          timestamp: Date.now(),
+          status: 'success',
+          signature: sellResult.signature
+        };
+
+        // Notify UI about position closure and trade
+        if (this.onPriceUpdateCallback) {
+          this.onPriceUpdateCallback({
+            type: 'positionClosed',
+            tokenAddress: token.address,
+            tokenSymbol: token.symbol,
+            exitPrice: sellResult.price,
+            exitReason,
+            sellTrade
+          });
+        }
+        
         console.log(`✅ Successfully exited position: ${token.symbol} - ${exitReason}`);
         console.log(`💰 Exit price: ${sellResult.price} SOL, Transaction: ${sellResult.signature}`);
       } else {
@@ -151,7 +176,7 @@ export class TradingService {
     }
   }
 
-  private getAutonomousWallet(): AutonomousWalletAdapter | null {
+  getAutonomousWallet(): AutonomousWalletAdapter | null {
     if (!this.autonomousWallet) return null;
     return new AutonomousWalletAdapter(this.autonomousWallet);
   }
@@ -204,6 +229,14 @@ export class TradingService {
     }
 
     console.log(`🤖 AUTONOMOUS SELL: ${token.symbol}`);
+    
+    // Check if we already have a recent sell attempt for this token (prevent double sells)
+    const position = this.positionManager?.getPosition(token.address);
+    if (position && !position.isActive) {
+      console.log(`⚠️ Position ${token.symbol} is already closed or being closed`);
+      return null;
+    }
+    
     return this.executeSell(token, autonomousWallet, slippage);
   }
 
@@ -818,14 +851,40 @@ export class TradingService {
         
         const success = await this.autonomousWallet.confirmTransaction(signature);
         if (!success) {
-          console.log(`❌ Sell transaction failed for ${token.symbol}: ${signature}`);
+          console.log(`❌ Sell transaction confirmation failed for ${token.symbol}: ${signature}`);
           console.log(`🔗 Check transaction: https://solscan.io/tx/${signature}`);
           console.log(`💡 This might be due to:`);
+          console.log(`   - Transaction confirmation timeout (may still succeed)`);
           console.log(`   - Token migration to Raydium`);
           console.log(`   - Insufficient liquidity`);
           console.log(`   - Slippage tolerance too low`);
           console.log(`   - Network congestion`);
-          throw new Error(`Sell transaction failed: ${signature}`);
+          console.log(`⚠️ NOTE: Transaction may still be successful - check Solscan manually`);
+          
+          // Don't immediately throw - the transaction might still be processing
+          // Instead, let's check the transaction one more time after a delay
+          console.log(`🔄 Waiting 5 seconds before final transaction check...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          try {
+            const finalCheck = await rpcRateLimiter.executeRPCCall(
+              () => this.connection.getTransaction(signature, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0
+              }),
+              'getTransaction(final_sell_check)'
+            );
+            
+            if (finalCheck && !finalCheck.meta?.err) {
+              console.log(`✅ Final check: Sell transaction was actually successful: ${signature}`);
+              // Continue with success path
+            } else {
+              throw new Error(`Sell transaction failed after final check: ${signature}`);
+            }
+          } catch (finalError) {
+            console.error(`❌ Final transaction check failed:`, finalError);
+            throw new Error(`Sell transaction failed: ${signature}`);
+          }
         }
       } else {
         console.log(`📱 Using browser wallet for sell (requires manual approval)`);

@@ -4,6 +4,7 @@ import type { Token, Trade, Position, BotConfig } from '@/types';
 import { PumpFunTradingBot, type BotStats, type BotEventListener } from '@/services/pumpFunBot';
 import { RiskManager } from '@/services/riskManager';
 import { AnalyticsService } from '@/services/analytics';
+import { generateTradeId, generatePositionId } from '@/utils/idGenerator';
 
 export interface UseBotState {
   // Bot state
@@ -149,10 +150,30 @@ export function useBot(): UseBotState {
       }
     },
     
-    onPositionClosed: (position: Position) => {
+    onPositionClosed: (position: Position, sellTrade?: Trade) => {
+      console.log('🔒 Position closed:', position.tokenSymbol, 'Status:', position.status);
+      
+      // Update position status to closed
       setPositions(prev => prev.map(pos => 
-        pos.id === position.id ? position : pos
+        pos.id === position.id ? { ...position, status: 'closed' } : pos
       ));
+      
+      // Add sell trade to history if provided
+      if (sellTrade) {
+        console.log('📝 Adding sell trade to history:', sellTrade);
+        setTrades(prev => [sellTrade, ...prev.slice(0, 99)]); // Keep last 100
+        setStats(prev => ({ 
+          ...prev, 
+          tradesExecuted: prev.tradesExecuted + 1,
+          successfulTrades: sellTrade.status === 'success' ? prev.successfulTrades + 1 : prev.successfulTrades,
+          failedTrades: sellTrade.status === 'failed' ? prev.failedTrades + 1 : prev.failedTrades
+        }));
+      }
+      
+      // Remove from live monitoring after a delay to allow user to see final status
+      setTimeout(() => {
+        setPositions(prev => prev.filter(pos => pos.id !== position.id));
+      }, 5000); // Remove after 5 seconds
     },
     
     onPriceUpdate: (update: { tokenAddress: string; tokenSymbol: string; currentPrice: number; entryPrice: number; pnl: number; pnlPercent: number; amount: number; solInvested: number; }) => {
@@ -293,7 +314,7 @@ export function useBot(): UseBotState {
   // TEST: Add a dummy position for testing the amount calculation
   const addTestPosition = useCallback(() => {
     const testTrade: Trade = {
-      id: 'test_' + Date.now(),
+      id: generateTradeId('test'),
       type: 'buy',
       tokenAddress: 'HwN6vNdaY89fzuHUhzLD9JyCdyCtpvxE2tApw1u5pump',
       tokenSymbol: 'INTERN', 
@@ -309,7 +330,7 @@ export function useBot(): UseBotState {
     const tokenAmount = testTrade.amount / testTrade.price;
     
     const position: Position = {
-      id: `pos_${testTrade.id}`,
+      id: generatePositionId(),
       tokenAddress: testTrade.tokenAddress,
       tokenSymbol: testTrade.tokenSymbol,
       tokenName: testTrade.tokenSymbol,
